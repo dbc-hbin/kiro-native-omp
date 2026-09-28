@@ -1,6 +1,6 @@
 # Kiro Native for OMP
 
-Standalone OMP provider extension for Kiro's AWS Builder ID / CodeWhisperer streaming endpoint. Source and tests live in this repository; no import from another checkout is required. Bun is required for the extension and tests.
+Standalone OMP provider extension for Kiro's regional runtime streaming API. Source and tests live in this repository; no import from another checkout is required. Bun is required for the extension and tests.
 
 ## Install
 
@@ -8,26 +8,31 @@ Standalone OMP provider extension for Kiro's AWS Builder ID / CodeWhisperer stre
 cd ~/Documents/kiro-native-omp
 bun install
 ln -s "$PWD" ~/.omp/agent/extensions/kiro-native
-omp models kiro-native
 ```
 
-OMP discovers `index.ts` through the linked directory. If the extension directory already exists, move its contents into this repository before creating the link; do not leave two copies of the provider enabled. Alternatively, run with `omp -e "$PWD/index.ts"` without automatic discovery.
+OMP discovers `index.ts` through the linked directory. If that extension directory already exists, move its contents into this repository before creating the link; do not enable two copies of the provider. Alternatively, run with `omp -e "$PWD/index.ts"` without automatic discovery.
 
 ## Sign in and use
 
 ```sh
 omp login kiro-native
 omp --model kiro-native/auto -p 'Reply with OK.'
+omp --model kiro-native/gpt-5.6-sol -p 'Reply with OK.'
 ```
 
-The login uses AWS Builder ID's device authorization flow and stores the access/refresh token through OMP's OAuth credential store. `streamSimple` receives the access token and the API region/profile ARN encoded by the OAuth provider; only the access token is sent as a Bearer token. For an existing SSO bearer token, OMP's `--api-key` may supply it directly. This AWS CodeWhisperer request schema has no per-request model selector, so the extension exposes one `auto` model instead of advertising GPT/Claude variants it cannot select. Its context/output limits are conservative client-side caps, not a service capability guarantee. This extension does **not** implement Kiro `ksk_` API-key authentication; that is a different endpoint/protocol. Never put credentials in this repository.
+The login uses AWS Builder ID device authorization and stores access/refresh tokens in OMP's OAuth credential store. The request uses only the access token as a Bearer token; Builder ID's service profile ARN is attached **only to the request**, not stored as account metadata. A raw `--api-key` bearer token lacks that Builder ID metadata and may be rejected by models requiring a profile. Kiro `ksk_` API keys are not supported by this OAuth transport.
+
+The extension registers Auto and released Kiro model IDs from the published model catalog. The selected ID is sent as `conversationState.currentMessage.userInputMessage.modelId` (and on replayed user turns); Auto sends `auto`. Account tier, region, and model governance still determine which models Kiro accepts. GPT-5.6 availability is experimental and region/tier limited. Client-side context/output limits do not guarantee service entitlement.
+
+Requests go to `https://runtime.<apiRegion>.kiro.dev/` with `AmazonCodeWhispererStreamingService.GenerateAssistantResponse` and AWS eventstream responses. Builder ID uses the CLI-shaped request; enterprise credentials with their own profile ARN use the IDE-shaped request. The older `codewhisperer.<region>.amazonaws.com/generateAssistantResponse` route is not used.
+
+Successful responses retain the outbound conversation ID unless Kiro supplies a valid replacement, so tool-result turns continue even without response metadata. A response containing only reasoning and no answer or tool call is reported as an error, not a completed turn.
 
 ## Development
 
 ```sh
 bun test
 bun run check
-omp models kiro-native
 ```
 
-`index.ts` registers the provider, `oauth.ts` implements device authorization and refresh, `messages.ts` builds the CodeWhisperer request, `stream.ts` performs the HTTPS/eventstream exchange, and `schema.ts` adapts OMP tool schemas. HTTP transport tests use a controlled fetch response; registration can be checked without credentials, while a live prompt requires a valid Kiro account and service access. The AWS endpoint is `/generateAssistantResponse` and its request/event shapes follow the generated CodeWhisperer streaming client, not the older root-path RPC.
+`index.ts` registers models; `oauth.ts` handles device authorization and refresh; `messages.ts` builds model-selected conversation requests; `stream.ts` performs the HTTPS/eventstream exchange; `schema.ts` adapts tool schemas. Tests exercise the transport at a controlled network boundary. A successful live prompt requires a valid Kiro account and access to the selected model. OMP's `models` catalog command may not list extension-provided models even when `--model kiro-native/<id>` loads them.

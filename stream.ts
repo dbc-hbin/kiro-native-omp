@@ -2,8 +2,9 @@ import { decodeEventStream } from "./eventstream";
 import { buildKiroRequest } from "./messages";
 import type { JsonRecord, ModelLike, OmpAssistantEvent, OmpAssistantMessage, OmpContext, OmpContent, OmpUsage, StreamOptionsLike } from "./types";
 
-const ENDPOINT = "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse";
-const TARGET = "AmazonCodeWhispererService.GenerateAssistantResponse";
+const TARGET = "AmazonCodeWhispererStreamingService.GenerateAssistantResponse";
+const BUILDER_ID_SERVICE_PROFILE_ARN = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
+const textDecoder = new TextDecoder();
 
 function emptyUsage(): OmpUsage {
   return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
@@ -50,27 +51,29 @@ function record(value: unknown): JsonRecord | undefined {
 }
 
 function payloadObject(bytes: Uint8Array): JsonRecord {
-  const value: unknown = JSON.parse(new TextDecoder().decode(bytes));
+  const value: unknown = JSON.parse(textDecoder.decode(bytes));
   const object = record(value);
   if (!object) throw new Error("Kiro event payload must be an object");
   return object;
 }
 
-function credential(value: string | undefined): { token: string; region: string; profileArn?: string } {
+function credential(value: string | undefined): { token: string; region: string; profileArn?: string; authType?: "kiro_desktop" | "aws_sso_oidc" } {
   if (!value?.trim()) throw new Error("No Kiro OAuth bearer token. Sign in to Kiro with AWS Builder ID or provide --api-key.");
   if (!value.trimStart().startsWith("{")) {
-    if (value.startsWith("ksk_")) throw new Error("Kiro ksk_ API keys require the separate API-key endpoint; sign in with AWS Builder ID for bearer transport.");
+    if (value.trim().startsWith("ksk_")) throw new Error("Kiro ksk_ API keys require the separate API-key endpoint; sign in with AWS Builder ID for bearer transport.");
     return { token: value, region: "us-east-1" };
   }
   let parsed: unknown;
   try { parsed = JSON.parse(value); } catch { throw new Error("Invalid Kiro OAuth credential envelope"); }
   const data = record(parsed);
   if (data?.version !== 1 || typeof data.token !== "string" || !data.token.trim()) throw new Error("Invalid Kiro OAuth credential envelope");
-  if (data.token.startsWith("ksk_")) throw new Error("Kiro ksk_ API keys cannot be used as an AWS SSO bearer token");
+  if (data.token.trim().startsWith("ksk_")) throw new Error("Kiro ksk_ API keys cannot be used as an AWS SSO bearer token");
   const region = data.apiRegion ?? "us-east-1";
   if (typeof region !== "string" || !/^[a-z]{2}(?:-gov)?-[a-z]+-\d$/.test(region)) throw new Error("Invalid Kiro AWS region");
   if (data.profileArn !== undefined && (typeof data.profileArn !== "string" || !/^arn:[^\s]+$/.test(data.profileArn))) throw new Error("Invalid Kiro profile ARN");
-  return { token: data.token, region, ...(typeof data.profileArn === "string" ? { profileArn: data.profileArn } : {}) };
+  if (data.authType !== undefined && data.authType !== "kiro_desktop" && data.authType !== "aws_sso_oidc") throw new Error("Invalid Kiro authentication type");
+  return { token: data.token, region, ...(typeof data.profileArn === "string" ? { profileArn: data.profileArn } : {}),
+    ...(data.authType ? { authType: data.authType } : {}) };
 }
 
 function applyUsage(message: OmpAssistantMessage, event: JsonRecord): void {
@@ -99,17 +102,35 @@ export function streamKiro(model: ModelLike, context: OmpContext, options?: Stre
     stream.push({ type: "start", partial: message });
     try {
       const auth = credential(options?.apiKey);
-      const built = buildKiroRequest(context, model.id, options, ["eval"]);
-      if (auth.profileArn) built.payload.profileArn = auth.profileArn;
+      const ownProfileArn = auth.profileArn === BUILDER_ID_SERVICE_PROFILE_ARN ? undefined : auth.profileArn;
+      const builderFallback = !ownProfileArn && auth.authType === "aws_sso_oidc";
+      const wireClient = ownProfileArn ? "ide" : "cli";
+      const profileArn = ownProfileArn ?? (builderFallback ? BUILDER_ID_SERVICE_PROFILE_ARN : undefined);
+      const built = buildKiroRequest(context, model.id, options, ["eval"], wireClient);
+      if (profileArn) built.payload.profileArn = profileArn;
+      const cliAgent = wireClient === "cli"
+        ? `aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17975 os/${process.platform === "win32" ? "windows" : process.platform === "darwin" ? "macos" : "linux"} lang/rust/1.92.0 m/F app/AmazonQ-For-CLI`
+        : undefined;
 
-      const response = await fetch(auth.region === "us-east-1" ? ENDPOINT : `https://codewhisperer.${auth.region}.amazonaws.com/generateAssistantResponse`, {
+      const response = await fetch(`https://runtime.${auth.region}.kiro.dev/`, {
         method: "POST", redirect: "error", signal: options?.signal,
         headers: {
-          "content-type": "application/json",
-          accept: "application/vnd.amazon.eventstream",
+          "content-type": "application/x-amz-json-1.0",
+          accept: wireClient === "cli" ? "*/*" : "application/vnd.amazon.eventstream",
           authorization: `Bearer ${auth.token}`,
-          "amzn-X-amz-target": TARGET,
-          ...(auth.profileArn ? { "x-amzn-codewhisperer-proflearn": auth.profileArn } : {}),
+          "x-amz-target": TARGET,
+          ...(profileArn ? { "x-amzn-kiro-profile-arn": profileArn } : {}),
+          "x-amzn-codewhisperer-optout": "true",
+          "amz-sdk-invocation-id": crypto.randomUUID(),
+          ...(cliAgent ? {
+            "user-agent": cliAgent.replace(" m/F", " md/appVersion-2.14.2 m/F"),
+            "x-amz-user-agent": cliAgent,
+            "amz-sdk-request": "attempt=1; max=3",
+          } : {
+            "user-agent": "aws-sdk-js/1.0.27 ua/2.1 api/codewhispererstreaming#1.0.27 m/E KiroIDE-1.0.0",
+            "x-amz-user-agent": "aws-sdk-js/1.0.27 KiroIDE-1.0.0",
+            "x-amzn-kiro-agent-mode": "vibe",
+          }),
         },
         body: JSON.stringify(built.payload),
       });
@@ -123,6 +144,7 @@ export function streamKiro(model: ModelLike, context: OmpContext, options?: Stre
       if (!response.body) throw new Error("Kiro CodeWhisperer response has no body");
 
       let textIndex: number | undefined;
+      let thinkingIndex: number | undefined;
       let openTool: { id: string; name: string; index: number; raw: string } | undefined;
       let completedToolId: string | undefined;
       let stopReason: string | undefined;
@@ -132,6 +154,13 @@ export function streamKiro(model: ModelLike, context: OmpContext, options?: Stre
         textIndex = undefined;
         const block = message.content[index] as Extract<OmpContent, { type: "text" }>;
         stream.push({ type: "text_end", contentIndex: index, content: block.text, partial: message });
+      };
+      const closeThinking = () => {
+        if (thinkingIndex === undefined) return;
+        const index = thinkingIndex;
+        thinkingIndex = undefined;
+        const block = message.content[index] as Extract<OmpContent, { type: "thinking" }>;
+        stream.push({ type: "thinking_end", contentIndex: index, content: block.thinking, partial: message });
       };
       const closeTool = () => {
         if (!openTool) return;
@@ -152,7 +181,7 @@ export function streamKiro(model: ModelLike, context: OmpContext, options?: Stre
         if (kind === "exception" || kind === "error") {
           let detail: string | undefined;
           if (frame.payload.length) {
-            const raw = new TextDecoder().decode(frame.payload);
+            const raw = textDecoder.decode(frame.payload);
             try {
               const body = record(JSON.parse(raw));
               detail = typeof body?.message === "string" ? body.message : raw;
@@ -169,6 +198,7 @@ export function streamKiro(model: ModelLike, context: OmpContext, options?: Stre
         if (typeof error?.message === "string") throw new Error(`Kiro stream error: ${error.message}`);
         if (eventType === "assistantResponseEvent") {
           closeTool();
+          closeThinking();
           if (typeof ev.content !== "string" || !ev.content) continue;
           if (textIndex === undefined) {
             textIndex = message.content.length;
@@ -178,8 +208,29 @@ export function streamKiro(model: ModelLike, context: OmpContext, options?: Stre
           const block = message.content[textIndex] as Extract<OmpContent, { type: "text" }>;
           block.text += ev.content;
           stream.push({ type: "text_delta", contentIndex: textIndex, delta: ev.content, partial: message });
+        } else if (eventType === "reasoningContentEvent") {
+          closeTool();
+          closeText();
+          if (ev.text !== undefined && typeof ev.text !== "string") throw new Error("Kiro reasoning text must be a string");
+          if (ev.signature !== undefined && typeof ev.signature !== "string") throw new Error("Kiro reasoning signature must be a string");
+          if (ev.redactedContent !== undefined && typeof ev.redactedContent !== "string") throw new Error("Kiro reasoning redactedContent must be a string");
+          if (ev.text || ev.signature || ev.redactedContent) {
+            if (thinkingIndex === undefined) {
+              thinkingIndex = message.content.length;
+              message.content.push({ type: "thinking", thinking: "" });
+              stream.push({ type: "thinking_start", contentIndex: thinkingIndex, partial: message });
+            }
+            const block = message.content[thinkingIndex] as Extract<OmpContent, { type: "thinking" }>;
+            if (typeof ev.text === "string" && ev.text) {
+              block.thinking += ev.text;
+              stream.push({ type: "thinking_delta", contentIndex: thinkingIndex, delta: ev.text, partial: message });
+            }
+            if (typeof ev.signature === "string") block.thinkingSignature = `kiro:signature:${ev.signature}`;
+            else if (typeof ev.redactedContent === "string") block.thinkingSignature = `kiro:redactedContent:${ev.redactedContent}`;
+          }
         } else if (eventType === "toolUseEvent") {
           closeText();
+          closeThinking();
           const id = typeof ev.toolUseId === "string" ? ev.toolUseId : openTool?.id;
           if (!id) throw new Error("Kiro tool event missing id");
           if (!openTool && completedToolId === id && ev.input === undefined && ev.stop !== undefined) continue;
@@ -202,8 +253,10 @@ export function streamKiro(model: ModelLike, context: OmpContext, options?: Stre
             }
           }
           if (ev.stop !== undefined && ev.stop !== false && openTool) closeTool();
-        } else if (eventType === "messageMetadataEvent") {
-          if (typeof ev.conversationId === "string") message.responseId = ev.conversationId;
+        } else if (eventType === "messageMetadataEvent" || eventType === "initial-response") {
+          if (typeof ev.conversationId === "string" && /^[A-Za-z0-9._:-]{1,256}$/.test(ev.conversationId)) {
+            message.responseId = ev.conversationId;
+          }
         } else if (eventType === "metadataEvent") {
           if (typeof ev.stopReason === "string") stopReason = ev.stopReason;
           applyUsage(message, ev);
@@ -214,7 +267,20 @@ export function streamKiro(model: ModelLike, context: OmpContext, options?: Stre
       if (options?.signal?.aborted) throw new Error("Request was aborted");
       closeTool();
       closeText();
-      const reason = message.content.some(part => part.type === "toolCall") ? "toolUse" : stopReason === "MAX_TOKENS" ? "length" : "stop";
+      closeThinking();
+      let hasThinking = false;
+      let hasToolCall = false;
+      let hasAnswer = false;
+      for (const part of message.content) {
+        if (part.type === "thinking") hasThinking = true;
+        else if (part.type === "toolCall") { hasToolCall = true; hasAnswer = true; }
+        else if (part.type === "text" && part.text.trim()) hasAnswer = true;
+      }
+      if (hasThinking && !hasAnswer) {
+        throw new Error("Kiro completed without an answer or tool call");
+      }
+      message.responseId ??= built.payload.conversationState.conversationId;
+      const reason = hasToolCall ? "toolUse" : stopReason === "MAX_TOKENS" ? "length" : "stop";
       message.stopReason = reason;
       stream.push({ type: "done", reason, message });
     } catch (error) {

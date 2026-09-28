@@ -15,7 +15,7 @@ export type OmpContent =
 
 export type OmpMessage =
   | { role: "user" | "developer"; content: string | OmpContent[]; timestamp?: number }
-  | { role: "assistant"; content: OmpContent[]; timestamp?: number }
+  | { role: "assistant"; content: OmpContent[]; timestamp?: number; provider?: string; responseId?: string }
   | {
       role: "toolResult";
       toolCallId: string;
@@ -75,24 +75,31 @@ export interface KiroToolResult {
 
 export interface KiroUserInputMessage {
   content: string;
-  origin?: "CLI" | "AI_EDITOR";
+  modelId: string;
+  origin: "KIRO_CLI" | "AI_EDITOR";
   userInputMessageContext?: {
     tools?: KiroToolSpecification[];
     toolResults?: KiroToolResult[];
   };
 }
 
+export type KiroReasoningContent = { signature: string } | { redactedContent: string };
+
 export interface KiroHistoryEntry {
   userInputMessage?: KiroUserInputMessage;
   assistantResponseMessage?: {
     content: string;
     toolUses?: KiroToolUse[];
+    reasoningContent?: KiroReasoningContent;
   };
 }
 
 export interface KiroRequestPayload {
   conversationState: {
     chatTriggerType: "MANUAL";
+    conversationId: string;
+    agentContinuationId?: string;
+    agentTaskType?: "vibe";
     currentMessage: { userInputMessage: KiroUserInputMessage };
     history?: KiroHistoryEntry[];
   };

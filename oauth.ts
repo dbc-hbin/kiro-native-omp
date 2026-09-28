@@ -251,6 +251,7 @@ export function kiroOAuthProvider() {
         token: credentials.access,
         apiRegion: credentials.kiro?.apiRegion,
         profileArn: credentials.kiro?.profileArn,
+        authType: credentials.kiro?.authType,
       });
     },
   };

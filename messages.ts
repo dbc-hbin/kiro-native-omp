@@ -1,8 +1,9 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { buildKiroToolCatalog, createToolNameRegistry } from "./schema";
 import type {
   BuiltKiroRequest,
   KiroHistoryEntry,
+  KiroReasoningContent,
   KiroToolResult,
   KiroToolUse,
   KiroRequestPayload,
@@ -18,7 +19,7 @@ const EMPTY_RESULT = "The tool completed without textual output.";
 
 type Turn =
   | { kind: "user"; content: string; toolResults: KiroToolResult[] }
-  | { kind: "assistant"; content: string; toolUses: KiroToolUse[] };
+  | { kind: "assistant"; content: string; toolUses: KiroToolUse[]; reasoningContent?: KiroReasoningContent };
 
 function append(target: string, next: string): string {
   if (!next) return target;
@@ -37,6 +38,28 @@ function normalizedToolId(id: string): string {
   return `${base}_${createHash("sha256").update(id).digest("hex").slice(0, 12)}`;
 }
 
+function normalizeKiroModelId(id: string): string {
+  let model = id.trim().toLowerCase().replace(/^kiro\//, "").replace(/^kiro-/, "");
+  if (model === "auto") return "auto";
+  model = model.replace(/-\d{8}$/, "").replace(/-(low|medium|high|xhigh|max)$/, "");
+  model = model.replace(/(\d+)-(\d+)/g, "$1.$2");
+  return model.replace(/^claude-([\d.]+)-(sonnet|opus|haiku)$/, "claude-$2-$1");
+}
+
+function conversationId(context: OmpContext): string {
+  // Kiro may return its conversation ID on an assistant response. Reuse only
+  // bounded, printable IDs from our own provider; never infer one from prompts,
+  // since unrelated conversations can start with identical text.
+  for (let index = context.messages.length - 1; index >= 0; index--) {
+    const message = context.messages[index];
+    if (message.role !== "assistant" || message.provider !== "kiro-native") continue;
+    if (typeof message.responseId === "string" && /^[A-Za-z0-9._:-]{1,256}$/.test(message.responseId)) {
+      return message.responseId;
+    }
+  }
+  return randomUUID();
+}
+
 function pushUser(turns: Turn[], content: string, toolResults: KiroToolResult[] = []): void {
   const last = turns.at(-1);
   if (last?.kind === "user") {
@@ -51,13 +74,15 @@ function pushAssistant(
   turns: Turn[],
   content: string,
   toolUses: KiroToolUse[],
+  reasoningContent?: KiroReasoningContent,
 ): void {
   const last = turns.at(-1);
   if (last?.kind === "assistant") {
     last.content = append(last.content, content);
     last.toolUses.push(...toolUses);
+    if (reasoningContent) last.reasoningContent = reasoningContent;
   } else {
-    turns.push({ kind: "assistant", content, toolUses: [...toolUses] });
+    turns.push({ kind: "assistant", content, toolUses: [...toolUses], ...(reasoningContent ? { reasoningContent } : {}) });
   }
 }
 
@@ -66,13 +91,14 @@ export function buildKiroRequest(
   modelId: string,
   options?: StreamOptionsLike,
   reserveToolNames: readonly string[] = [],
+  wireClient: "cli" | "ide" = "cli",
 ): BuiltKiroRequest {
   const toolChoice = options?.toolChoice;
   if (toolChoice !== undefined && toolChoice !== "auto" && toolChoice !== "none") {
     throw new Error(`Kiro supports only automatic tool choice or toolChoice:none, got ${JSON.stringify(toolChoice)}`);
   }
   const registry = createToolNameRegistry();
-  const wireModelId = modelId.replace(/(\d)-(\d)/g, "$1.$2");
+  const wireModelId = normalizeKiroModelId(modelId);
   const catalog = buildKiroToolCatalog(toolChoice === "none" ? [] : (context.tools ?? []), wireModelId, registry, reserveToolNames);
   const turns: Turn[] = [];
   const priorCalls = new Map<string, { rawId: string; name: string }>();
@@ -88,7 +114,18 @@ export function buildKiroRequest(
     if (msg.role === "assistant") {
       const text = contentText(msg.content);
       const toolUses: KiroToolUse[] = [];
+      let reasoningContent: KiroReasoningContent | undefined;
       for (const part of msg.content) {
+        // Only our stream's tagged blobs can be replayed: signature and
+        // redactedContent are distinct wire fields, not interchangeable bytes.
+        if (part.type === "thinking" && part.thinkingSignature) {
+          const signature = part.thinkingSignature;
+          if (signature.startsWith("kiro:signature:") && signature.length > "kiro:signature:".length) {
+            reasoningContent = { signature: signature.slice("kiro:signature:".length) };
+          } else if (signature.startsWith("kiro:redactedContent:") && signature.length > "kiro:redactedContent:".length) {
+            reasoningContent = { redactedContent: signature.slice("kiro:redactedContent:".length) };
+          }
+        }
         if (part.type !== "toolCall") continue;
         const name = registry.alias(part.name);
         const toolUseId = normalizedToolId(part.id);
@@ -96,7 +133,7 @@ export function buildKiroRequest(
         priorCalls.set(toolUseId, { rawId: part.id, name });
         toolUses.push({ name, input: part.arguments ?? {}, toolUseId });
       }
-      if (text || toolUses.length > 0) pushAssistant(turns, text, toolUses);
+      if (text || toolUses.length > 0) pushAssistant(turns, text, toolUses, reasoningContent);
       continue;
     }
     if (msg.role !== "toolResult") throw new Error("Unsupported Kiro message role");
@@ -128,19 +165,22 @@ export function buildKiroRequest(
         assistantResponseMessage: {
           content: turn.content,
           ...(turn.toolUses.length ? { toolUses: turn.toolUses } : {}),
+          ...(turn.reasoningContent ? { reasoningContent: turn.reasoningContent } : {}),
         },
       }
     : {
         userInputMessage: {
           content: turn.content,
-          origin: "CLI",
+          modelId: wireModelId,
+          origin: wireClient === "cli" ? "KIRO_CLI" : "AI_EDITOR",
           ...(turn.toolResults.length ? { userInputMessageContext: { toolResults: turn.toolResults } } : {}),
         },
       };
   const history = turns.map(toEntry);
   const currentMessage: KiroUserInputMessage = {
     content: current.content,
-    origin: "CLI",
+    modelId: wireModelId,
+    origin: wireClient === "cli" ? "KIRO_CLI" : "AI_EDITOR",
     userInputMessageContext: {
       ...(current.toolResults.length ? { toolResults: current.toolResults } : {}),
       ...(catalog.tools.length ? { tools: catalog.tools } : {}),
@@ -154,6 +194,8 @@ export function buildKiroRequest(
   const payload: KiroRequestPayload = {
     conversationState: {
       chatTriggerType: "MANUAL",
+      ...(wireClient === "cli" ? { agentContinuationId: randomUUID(), agentTaskType: "vibe" as const } : {}),
+      conversationId: conversationId(context),
       currentMessage: { userInputMessage: currentMessage },
       ...(history.length ? { history } : {}),
     },

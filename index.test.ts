@@ -84,7 +84,7 @@ describe("Kiro native OMP translation", () => {
     expect(() => buildKiroRequest(context, "gpt-5.6-sol", { toolChoice: { type: "tool", name: "kiro_mock_probe" } })).toThrow(/supports only automatic tool choice/);
   });
 
-  test("serializes tool-only assistant and result as adjacent AWS turns", () => {
+  test("serializes tool-only assistant and result as adjacent Kiro turns", () => {
     const context: OmpContext = {
       systemPrompt: ["system"],
       tools: [{ name: "kiro_mock_probe", description: "probe", parameters: { type: "object", properties: {} } }],
@@ -97,7 +97,7 @@ describe("Kiro native OMP translation", () => {
     const built = buildKiroRequest(context, "gpt-5.6-sol", undefined, ["kiro_mock_probe"]);
     validateKiroConversation(built.payload);
     const { history, currentMessage } = built.payload.conversationState;
-    expect(history?.[0].userInputMessage).toEqual({ content: "system\n\ngo", origin: "CLI" });
+    expect(history?.[0].userInputMessage).toEqual({ content: "system\n\ngo", origin: "KIRO_CLI", modelId: "gpt-5.6-sol" });
     expect(history?.[1].assistantResponseMessage).toEqual({
       content: "",
       toolUses: [{ toolUseId: "call-1", name: "kiro_mock_probe", input: {} }],
@@ -106,8 +106,8 @@ describe("Kiro native OMP translation", () => {
       { toolUseId: "call-1", status: "success", content: [{ text: "done" }] },
     ]);
     expect(currentMessage.userInputMessage.userInputMessageContext?.tools?.[0].toolSpecification.name).toBe("kiro_mock_probe");
-    expect(currentMessage.userInputMessage.origin).toBe("CLI");
-    expect(currentMessage.userInputMessage).not.toHaveProperty("modelId");
+    expect(currentMessage.userInputMessage.origin).toBe("KIRO_CLI");
+    expect(currentMessage.userInputMessage.modelId).toBe("gpt-5.6-sol");
   });
 
   test("replays historical tool calls even when they are absent from the current catalog", () => {
@@ -158,7 +158,7 @@ describe("Kiro native OMP translation", () => {
     expect(payload.conversationState.currentMessage.userInputMessage.content).toBe("okay");
   });
 
-  test("rejects empty AWS result content and empty assistant turns", () => {
+  test("rejects empty Kiro result content and empty assistant turns", () => {
     const context: OmpContext = { messages: [
       { role: "user", content: "go" },
       { role: "assistant", content: [{ type: "toolCall", id: "call-1", name: "probe", arguments: {} }] },
@@ -243,6 +243,7 @@ describe("Kiro native OMP translation", () => {
     expect(authUrl).not.toContain("example.invalid");
     expect(credentials.access).toBe("access");
     expect(credentials.kiro?.clientId).toBe("client");
+    expect(credentials.kiro?.profileArn).toBeUndefined();
   });
 
   test("OAuth refresh preserves Kiro private metadata", async () => {
@@ -251,7 +252,7 @@ describe("Kiro native OMP translation", () => {
       refresh: "r",
       expires: 1,
       accountId: "id",
-      kiro: { profileArn: "arn:aws:codewhisperer:us-east-1:123456789012:profile/X", clientId: "c", clientSecret: "s", authType: "aws_sso_oidc" as const },
+      kiro: { profileArn: "arn:aws:codewhisperer:us-east-1:123456789012:profile/X", clientId: "c", clientSecret: "s", authType: "kiro_desktop" as const },
     };
     const fetchImpl = Object.assign(async () => new Response(JSON.stringify({
       accessToken: "new-access",
