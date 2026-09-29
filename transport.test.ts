@@ -316,3 +316,189 @@ test("abort signal is forwarded and terminates with aborted reason", async () =>
   const { message } = await collect(context, { apiKey: "plain-access", signal: controller.signal });
   expect(message.stopReason).toBe("aborted");
 });
+
+interface CapturedOutboundPayload {
+  conversationState: {
+    currentMessage: {
+      userInputMessage: {
+        content: string;
+        modelId: string;
+        origin: string;
+        userInputMessageContext?: {
+          tools?: unknown[];
+          toolResults?: Array<{
+            content: Array<{ text: string }>;
+            status: string;
+            toolUseId: string;
+          }>;
+        };
+      };
+    };
+    history?: unknown[];
+  };
+  additionalModelRequestFields?: {
+    reasoning?: { effort: string };
+    output_config?: { effort: string };
+  };
+}
+
+test("outbound JSON carries native reasoning.effort for GPT-5.6 at transport boundary", async () => {
+  let capturedPayload: CapturedOutboundPayload | undefined;
+  fetchSpy = spyOn(globalThis, "fetch").mockImplementation(
+    Object.assign(
+      async (_url: RequestInfo | URL, init?: RequestInit) => {
+        capturedPayload = JSON.parse(String(init?.body)) as CapturedOutboundPayload;
+        return framesToChunkedResponse([encodeEventFrame("assistantResponseEvent", { content: "OK" })]);
+      },
+      { preconnect: globalThis.fetch.preconnect },
+    ),
+  );
+
+  await collect(context, { apiKey: "plain-access", reasoning: "high" }, { ...model, id: "gpt-5.6-sol" });
+
+  expect(capturedPayload?.additionalModelRequestFields).toEqual({
+    reasoning: { effort: "high" },
+  });
+  expect(capturedPayload?.conversationState.currentMessage.userInputMessage.content).toBe("Be concise\n\nHello");
+  expect(capturedPayload?.conversationState.currentMessage.userInputMessage.modelId).toBe("gpt-5.6-sol");
+});
+
+test("outbound JSON carries native output_config.effort for Opus 5 and 5.5 at transport boundary", async () => {
+  const captured: CapturedOutboundPayload[] = [];
+  fetchSpy = spyOn(globalThis, "fetch").mockImplementation(
+    Object.assign(
+      async (_url: RequestInfo | URL, init?: RequestInit) => {
+        captured.push(JSON.parse(String(init?.body)) as CapturedOutboundPayload);
+        return framesToChunkedResponse([encodeEventFrame("assistantResponseEvent", { content: "OK" })]);
+      },
+      { preconnect: globalThis.fetch.preconnect },
+    ),
+  );
+
+  await collect(context, { apiKey: "plain-access", reasoning: "medium" }, { ...model, id: "claude-opus-5" });
+  await collect(context, { apiKey: "plain-access", reasoning: "low" }, { ...model, id: "claude-opus-5.5" });
+
+  expect(captured).toHaveLength(2);
+  expect(captured[0].additionalModelRequestFields).toEqual({
+    output_config: { effort: "medium" },
+  });
+  expect(captured[0].conversationState.currentMessage.userInputMessage.content).toBe("Be concise\n\nHello");
+  expect(captured[0].conversationState.currentMessage.userInputMessage.modelId).toBe("claude-opus-5");
+
+  expect(captured[1].additionalModelRequestFields).toEqual({
+    output_config: { effort: "low" },
+  });
+  expect(captured[1].conversationState.currentMessage.userInputMessage.content).toBe("Be concise\n\nHello");
+  expect(captured[1].conversationState.currentMessage.userInputMessage.modelId).toBe("claude-opus-5.5");
+});
+
+test("outbound JSON falls back to bounded thinking tags for Terra xhigh at transport boundary", async () => {
+  let capturedPayload: CapturedOutboundPayload | undefined;
+  fetchSpy = spyOn(globalThis, "fetch").mockImplementation(
+    Object.assign(
+      async (_url: RequestInfo | URL, init?: RequestInit) => {
+        capturedPayload = JSON.parse(String(init?.body)) as CapturedOutboundPayload;
+        return framesToChunkedResponse([encodeEventFrame("assistantResponseEvent", { content: "OK" })]);
+      },
+      { preconnect: globalThis.fetch.preconnect },
+    ),
+  );
+
+  await collect(
+    context,
+    { apiKey: "plain-access", reasoning: "xhigh", maxTokens: 5000 },
+    { ...model, id: "gpt-5.6-terra" },
+  );
+
+  expect(capturedPayload?.additionalModelRequestFields).toBeUndefined();
+  const content = capturedPayload?.conversationState.currentMessage.userInputMessage.content ?? "";
+  expect(content).toContain("<thinking_mode>enabled</thinking_mode>");
+  expect(content).toContain("<max_thinking_length>4500</max_thinking_length>");
+  expect(content.endsWith("Hello")).toBe(true);
+});
+
+test("outbound JSON emulates effort with bounded thinking tags for non-native models", async () => {
+  let capturedPayload: CapturedOutboundPayload | undefined;
+  fetchSpy = spyOn(globalThis, "fetch").mockImplementation(
+    Object.assign(
+      async (_url: RequestInfo | URL, init?: RequestInit) => {
+        capturedPayload = JSON.parse(String(init?.body)) as CapturedOutboundPayload;
+        return framesToChunkedResponse([encodeEventFrame("assistantResponseEvent", { content: "OK" })]);
+      },
+      { preconnect: globalThis.fetch.preconnect },
+    ),
+  );
+
+  await collect(
+    context,
+    { apiKey: "plain-access", reasoning: "medium", maxTokens: 2000 },
+    { ...model, id: "kiro-auto" },
+  );
+
+  expect(capturedPayload?.additionalModelRequestFields).toBeUndefined();
+  const content = capturedPayload?.conversationState.currentMessage.userInputMessage.content ?? "";
+  expect(content).toContain("<thinking_mode>enabled</thinking_mode>");
+  expect(content).toContain("<max_thinking_length>1000</max_thinking_length>");
+  expect(content.endsWith("Hello")).toBe(true);
+});
+
+test("outbound JSON leaves fields and content unmodified when reasoning is disabled or off", async () => {
+  const captured: CapturedOutboundPayload[] = [];
+  fetchSpy = spyOn(globalThis, "fetch").mockImplementation(
+    Object.assign(
+      async (_url: RequestInfo | URL, init?: RequestInit) => {
+        captured.push(JSON.parse(String(init?.body)) as CapturedOutboundPayload);
+        return framesToChunkedResponse([encodeEventFrame("assistantResponseEvent", { content: "OK" })]);
+      },
+      { preconnect: globalThis.fetch.preconnect },
+    ),
+  );
+
+  await collect(
+    context,
+    { apiKey: "plain-access", reasoning: "high", disableReasoning: true },
+    { ...model, id: "gpt-5.6-sol" },
+  );
+  await collect(
+    context,
+    { apiKey: "plain-access", reasoning: "high", forceReasoningOff: true },
+    { ...model, id: "kiro-auto" },
+  );
+
+  expect(captured).toHaveLength(2);
+  for (const payload of captured) {
+    expect(payload.additionalModelRequestFields).toBeUndefined();
+    expect(payload.conversationState.currentMessage.userInputMessage.content).toBe("Be concise\n\nHello");
+  }
+});
+
+test("outbound JSON leaves tool-result turn content unmodified even with effort active", async () => {
+  const toolCtx: OmpContext = {
+    messages: [
+      { role: "user", content: "Run action" },
+      { role: "assistant", content: [{ type: "toolCall", id: "t-1", name: "tool_a", arguments: {} }] },
+      { role: "toolResult", toolCallId: "t-1", toolName: "tool_a", content: [{ type: "text", text: "done" }], isError: false },
+    ],
+  };
+
+  let capturedPayload: CapturedOutboundPayload | undefined;
+  fetchSpy = spyOn(globalThis, "fetch").mockImplementation(
+    Object.assign(
+      async (_url: RequestInfo | URL, init?: RequestInit) => {
+        capturedPayload = JSON.parse(String(init?.body)) as CapturedOutboundPayload;
+        return framesToChunkedResponse([encodeEventFrame("assistantResponseEvent", { content: "Finished" })]);
+      },
+      { preconnect: globalThis.fetch.preconnect },
+    ),
+  );
+
+  await collect(toolCtx, { apiKey: "plain-access", reasoning: "high" }, { ...model, id: "kiro-auto" });
+
+  expect(capturedPayload?.additionalModelRequestFields).toBeUndefined();
+  const current = capturedPayload?.conversationState.currentMessage.userInputMessage;
+  expect(current?.content).toBe("The requested tool result is attached.");
+  expect(current?.content).not.toContain("<thinking_mode>");
+  expect(current?.userInputMessageContext?.toolResults).toEqual([
+    { toolUseId: "t-1", status: "success", content: [{ text: "done" }] },
+  ]);
+});

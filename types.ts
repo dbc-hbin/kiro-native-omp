@@ -1,3 +1,7 @@
+import type { KiroEffort } from "./constants";
+
+export type { KiroEffort };
+
 export type JsonRecord = Record<string, unknown>;
 
 export interface OmpTool {
@@ -15,7 +19,14 @@ export type OmpContent =
 
 export type OmpMessage =
   | { role: "user" | "developer"; content: string | OmpContent[]; timestamp?: number }
-  | { role: "assistant"; content: OmpContent[]; timestamp?: number; provider?: string; responseId?: string }
+  | {
+      role: "assistant";
+      content: OmpContent[];
+      timestamp?: number;
+      provider?: string;
+      responseId?: string;
+      stopReason?: "stop" | "length" | "toolUse" | "error" | "aborted";
+    }
   | {
       role: "toolResult";
       toolCallId: string;
@@ -35,13 +46,13 @@ export interface ModelLike {
   id: string;
   provider: string;
   api: string;
-  contextWindow?: number;
-  maxTokens?: number;
 }
 
 export interface StreamOptionsLike {
   apiKey?: string;
   signal?: AbortSignal;
+  /** OMP routes provider HTTP through this override when set. */
+  fetch?: typeof fetch;
   toolChoice?:
     | "auto"
     | "none"
@@ -51,6 +62,10 @@ export interface StreamOptionsLike {
     | { type: "function"; function: { name: string } }
     | { type: "tool"; name: string }
     | { type: "computer" };
+  reasoning?: KiroEffort;
+  disableReasoning?: boolean;
+  forceReasoningOff?: boolean;
+  maxTokens?: number;
 }
 
 export interface KiroToolSpecification {
@@ -104,6 +119,10 @@ export interface KiroRequestPayload {
     history?: KiroHistoryEntry[];
   };
   profileArn?: string;
+  additionalModelRequestFields?: {
+    reasoning?: { effort: KiroEffort };
+    output_config?: { effort: KiroEffort };
+  };
 }
 
 export interface ToolNameRegistry {

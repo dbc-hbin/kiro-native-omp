@@ -16,17 +16,24 @@ OMP discovers `index.ts` through the linked directory. If that extension directo
 
 ```sh
 omp login kiro-native
+omp models refresh kiro-native
+omp models kiro-native --json
 omp --model kiro-native/auto -p 'Reply with OK.'
-omp --model kiro-native/gpt-5.6-sol -p 'Reply with OK.'
 ```
 
 The login uses AWS Builder ID device authorization and stores access/refresh tokens in OMP's OAuth credential store. The request uses only the access token as a Bearer token; Builder ID's service profile ARN is attached **only to the request**, not stored as account metadata. A raw `--api-key` bearer token lacks that Builder ID metadata and may be rejected by models requiring a profile. Kiro `ksk_` API keys are not supported by this OAuth transport.
 
-The extension registers Auto and released Kiro model IDs from the published model catalog. The selected ID is sent as `conversationState.currentMessage.userInputMessage.modelId` (and on replayed user turns); Auto sends `auto`. Account tier, region, and model governance still determine which models Kiro accepts. GPT-5.6 availability is experimental and region/tier limited. Client-side context/output limits do not guarantee service entitlement.
+The provider pre-registers an offline fallback roster using the exact IDs Kiro's `ListAvailableModels` returns (`auto`, `gpt-5.6-*`, `claude-*` up to `claude-opus-5.5`, `claude-sonnet-4`, `deepseek-3.2`, `minimax-*`, `glm-5`, `qwen3-coder-next`). `claude-sonnet-5.5` is also pre-registered ahead of its Kiro release; Kiro rejects it with `INVALID_MODEL_ID` until your account lists it. OpenCodex's other preemptive IDs (`gpt-6-sol`, `gpt-6-luna`) are not pre-registered; discovery adds them once your account can use them. After AWS Builder ID login, OMP queries Kiro's `ListAvailableModels` endpoint and unifies newly discovered models for the authenticated account, caching dynamic models for 24 hours. `omp models refresh kiro-native` forces a new discovery query; `omp models kiro-native --json` shows all selectable IDs. Discovery uses the Builder ID OAuth token and its request-scoped service profile in `us-east-1`; OMP does not pass enterprise profile metadata to the discovery callback, so enterprise-specific discovery is not supported.
+
+Selecting an ID or having it listed in the catalog is not an entitlement guarantee: tier-restricted or newly announced models may be rejected upstream by Kiro until supported by your account and region. The selected ID is sent as `conversationState.currentMessage.userInputMessage.modelId` (and on replayed user turns); `auto` (or `kiro-auto`) sends `auto`. Account tier, region, and model governance determine which models Kiro accepts. Client-side context and token limits do not guarantee service entitlement.
+
+The pre-registered and newly discovered models offer `low`, `medium`, `high`, `xhigh`, and `max` effort in OMP. If an ID discovered before this update still shows `-` under thinking, run `omp models refresh kiro-native` to replace its cached row. For example, `omp --model kiro-native/auto --thinking high -p 'Reply with OK.'`; select `--thinking off` to omit client effort controls. Kiro-native sends GPT-5.6/GPT-6 effort as `additionalModelRequestFields.reasoning.effort` and Opus 5/5.5 effort as `additionalModelRequestFields.output_config.effort`. GPT-5.6 Terra/Luna at `xhigh` and other models use bounded thinking instructions in the current user message instead; they do not have verified native effort support. `off` does not guarantee Kiro itself will produce no reasoning. The GPT-6 and Opus 5.5 mappings are preemptive, not verified with a currently entitled account.
 
 Requests go to `https://runtime.<apiRegion>.kiro.dev/` with `AmazonCodeWhispererStreamingService.GenerateAssistantResponse` and AWS eventstream responses. Builder ID uses the CLI-shaped request; enterprise credentials with their own profile ARN use the IDE-shaped request. The older `codewhisperer.<region>.amazonaws.com/generateAssistantResponse` route is not used.
 
 Successful responses retain the outbound conversation ID unless Kiro supplies a valid replacement, so tool-result turns continue even without response metadata. A response containing only reasoning and no answer or tool call is reported as an error, not a completed turn.
+
+OMP passes custom providers the raw session history, so the request builder applies the same tool pairing OMP's built-in providers get: every replayed tool call is answered in the next user turn, a call without a result gets an error result (`No result provided`, or `aborted` after an aborted/failed turn), duplicate results are dropped, and a result whose call was compacted away is kept as a `<stale-tool-result>` note. Kiro has no tool-choice field, so `toolChoice: "none"` offers no tools, a named choice offers only that tool, and `any`/`required` offer every tool; forced choices therefore do not fail the request, but the model may still answer without calling a tool.
 
 ## Development
 
@@ -35,4 +42,4 @@ bun test
 bun run check
 ```
 
-`index.ts` registers models; `oauth.ts` handles device authorization and refresh; `messages.ts` builds model-selected conversation requests; `stream.ts` performs the HTTPS/eventstream exchange; `schema.ts` adapts tool schemas. Tests exercise the transport at a controlled network boundary. A successful live prompt requires a valid Kiro account and access to the selected model. OMP's `models` catalog command may not list extension-provided models even when `--model kiro-native/<id>` loads them.
+`index.ts` registers the provider; `catalog.ts` fetches account models; `oauth.ts` handles device authorization and refresh; `messages.ts` builds model-selected conversation requests; `stream.ts` performs the HTTPS/eventstream exchange; `schema.ts` adapts tool schemas. Tests exercise the transport at a controlled network boundary; `omp-contract.test.ts` drives the provider through OMP's real `registerCustomApi`/`streamSimple` dispatch (`@oh-my-pi/pi-ai`, dev dependency pinned to the installed OMP version) with only the Kiro endpoint replaced. A successful live prompt requires a valid Kiro account and access to the selected model.

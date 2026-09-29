@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { KIRO_EFFORTS, type KiroEffort } from "./constants";
 import { buildKiroToolCatalog, createToolNameRegistry } from "./schema";
 import type {
   BuiltKiroRequest,
@@ -10,12 +11,57 @@ import type {
   KiroUserInputMessage,
   OmpContent,
   OmpContext,
+  OmpTool,
   StreamOptionsLike,
 } from "./types";
 
 const CONTINUATION = "Continue from the prior conversation. Do not quote or mention this instruction.";
 const RESULT_CARRIER = "The requested tool result is attached.";
 const EMPTY_RESULT = "The tool completed without textual output.";
+// Same placeholders OMP's transformMessages synthesizes for built-in providers.
+const MISSING_RESULT = "No result provided";
+const ABORTED_RESULT = "aborted";
+
+/**
+ * Kiro has no tool_choice field. Like OMP's transports without native forcing,
+ * narrow the offered catalog: `none` offers nothing, a named choice offers only
+ * that tool, and `any`/`required` keep every tool (the model still decides).
+ */
+function offeredTools(tools: readonly OmpTool[], toolChoice: StreamOptionsLike["toolChoice"]): readonly OmpTool[] {
+  if (toolChoice === "none") return [];
+  if (toolChoice === undefined || typeof toolChoice === "string") return tools;
+  const name = toolChoice.type === "computer"
+    ? "computer"
+    : "function" in toolChoice ? toolChoice.function.name : toolChoice.name;
+  const selected = tools.filter(tool => tool.name === name);
+  return selected.length > 0 ? selected : tools;
+}
+
+const VALID_EFFORTS = new Set<string>(KIRO_EFFORTS);
+
+const NATIVE_EFFORT_FIELDS: Record<string, "reasoning" | "output_config"> = {
+  "gpt-5.6-sol": "reasoning",
+  "gpt-5.6-terra": "reasoning",
+  "gpt-5.6-luna": "reasoning",
+  "gpt-6-sol": "reasoning",
+  "gpt-6-luna": "reasoning",
+  "claude-opus-5": "output_config",
+  "claude-opus-5.5": "output_config",
+};
+
+const EFFORT_RATIOS: Record<KiroEffort, number> = {
+  low: 0.20,
+  medium: 0.50,
+  high: 0.80,
+  xhigh: 0.90,
+  max: 0.95,
+};
+
+const THINKING_INSTRUCTION = [
+  "Think in English for better reasoning quality.",
+  "Be thorough and systematic, consider edge cases, challenge assumptions, and verify reasoning before answering.",
+  "After thinking, respond in the user's language.",
+].join("\n");
 
 type Turn =
   | { kind: "user"; content: string; toolResults: KiroToolResult[] }
@@ -93,25 +139,34 @@ export function buildKiroRequest(
   reserveToolNames: readonly string[] = [],
   wireClient: "cli" | "ide" = "cli",
 ): BuiltKiroRequest {
-  const toolChoice = options?.toolChoice;
-  if (toolChoice !== undefined && toolChoice !== "auto" && toolChoice !== "none") {
-    throw new Error(`Kiro supports only automatic tool choice or toolChoice:none, got ${JSON.stringify(toolChoice)}`);
-  }
   const registry = createToolNameRegistry();
   const wireModelId = normalizeKiroModelId(modelId);
-  const catalog = buildKiroToolCatalog(toolChoice === "none" ? [] : (context.tools ?? []), wireModelId, registry, reserveToolNames);
+  const catalog = buildKiroToolCatalog(offeredTools(context.tools ?? [], options?.toolChoice), wireModelId, registry, reserveToolNames);
   const turns: Turn[] = [];
   const priorCalls = new Map<string, { rawId: string; name: string }>();
+  // Kiro requires every assistant toolUse to be answered in the next user turn.
+  // OMP hands custom providers raw history, so pair calls here the way its
+  // built-in transformMessages does: missing results become error results.
+  let pending = new Map<string, string>();
+  let missingResultText = MISSING_RESULT;
+  const flushPending = () => {
+    for (const toolUseId of pending.keys()) {
+      pushUser(turns, "", [{ toolUseId, status: "error", content: [{ text: missingResultText }] }]);
+    }
+    pending = new Map();
+  };
 
   for (const msg of context.messages) {
     if (msg.role === "user" || msg.role === "developer") {
       if (Array.isArray(msg.content) && msg.content.some(part => part.type === "image")) {
         throw new Error("Kiro bearer does not translate user image content");
       }
+      flushPending();
       pushUser(turns, contentText(msg.content));
       continue;
     }
     if (msg.role === "assistant") {
+      flushPending();
       const text = contentText(msg.content);
       const toolUses: KiroToolUse[] = [];
       let reasoningContent: KiroReasoningContent | undefined;
@@ -131,8 +186,10 @@ export function buildKiroRequest(
         const toolUseId = normalizedToolId(part.id);
         if (priorCalls.has(toolUseId)) throw new Error(`duplicate Kiro tool use id ${toolUseId}`);
         priorCalls.set(toolUseId, { rawId: part.id, name });
+        pending.set(toolUseId, part.id);
         toolUses.push({ name, input: part.arguments ?? {}, toolUseId });
       }
+      missingResultText = msg.stopReason === "error" || msg.stopReason === "aborted" ? ABORTED_RESULT : MISSING_RESULT;
       if (text || toolUses.length > 0) pushAssistant(turns, text, toolUses, reasoningContent);
       continue;
     }
@@ -141,16 +198,24 @@ export function buildKiroRequest(
       throw new Error("Kiro bearer does not translate tool-result image content");
     }
     const toolUseId = normalizedToolId(msg.toolCallId);
-    const call = priorCalls.get(toolUseId);
-    if (!call || call.rawId !== msg.toolCallId) throw new Error(`orphaned tool result ${msg.toolCallId}`);
     const text = contentText(msg.content);
-    const result: KiroToolResult = {
-      toolUseId,
-      status: msg.isError ? "error" : "success",
-      content: [{ text: text.trim() ? text : EMPTY_RESULT }],
-    };
-    pushUser(turns, "", [result]);
+    if (pending.get(toolUseId) === msg.toolCallId) {
+      pending.delete(toolUseId);
+      pushUser(turns, "", [{
+        toolUseId,
+        status: msg.isError ? "error" : "success",
+        content: [{ text: text.trim() ? text : EMPTY_RESULT }],
+      }]);
+      continue;
+    }
+    // A late or duplicate result for an already-answered call would break
+    // adjacency; drop it. An orphan (its call folded away by compaction) keeps
+    // its text as plain user content once no result window is open.
+    if (priorCalls.has(toolUseId) || pending.size > 0 || !text.trim()) continue;
+    const errorAttr = msg.isError ? ' is-error="true"' : "";
+    pushUser(turns, `<stale-tool-result tool="${msg.toolName}" id="${msg.toolCallId}"${errorAttr}>\n${text}\n</stale-tool-result>`);
   }
+  flushPending();
 
   if (turns.length === 0 || turns[0].kind === "assistant") turns.unshift({ kind: "user", content: CONTINUATION, toolResults: [] });
   if (turns.at(-1)?.kind === "assistant") turns.push({ kind: "user", content: CONTINUATION, toolResults: [] });
@@ -158,6 +223,8 @@ export function buildKiroRequest(
 
   const current = turns.pop();
   if (!current || current.kind !== "user") throw new Error("Kiro request must end with a user turn");
+  const isContinuation = current.content === CONTINUATION;
+  const hasToolResults = current.toolResults.length > 0;
   const systemPrompt = typeof context.systemPrompt === "string" ? context.systemPrompt : context.systemPrompt?.join("\n\n");
   const systemPrefix = systemPrompt ? `${systemPrompt}\n\n` : "";
   const toEntry = (turn: Turn): KiroHistoryEntry => turn.kind === "assistant"
@@ -191,6 +258,42 @@ export function buildKiroRequest(
     if (firstUser) firstUser.content = systemPrefix + firstUser.content;
     else currentMessage.content = systemPrefix + currentMessage.content;
   }
+
+  const reasoning = options?.reasoning;
+  const isReasoningOff =
+    options?.disableReasoning === true ||
+    options?.forceReasoningOff === true ||
+    !reasoning;
+  let additionalModelRequestFields: KiroRequestPayload["additionalModelRequestFields"];
+
+  if (!isReasoningOff) {
+    if (!VALID_EFFORTS.has(reasoning)) {
+      throw new Error(`Kiro ${wireModelId} does not support reasoning effort ${JSON.stringify(reasoning)}`);
+    }
+    const effort = reasoning as KiroEffort;
+    let nativeField: "reasoning" | "output_config" | undefined;
+    if ((wireModelId === "gpt-5.6-terra" || wireModelId === "gpt-5.6-luna") && effort === "xhigh") {
+      nativeField = undefined;
+    } else {
+      nativeField = NATIVE_EFFORT_FIELDS[wireModelId];
+    }
+
+    if (nativeField) {
+      additionalModelRequestFields = { [nativeField]: { effort } };
+    } else if (!isContinuation && !hasToolResults) {
+      const maxTokens = options?.maxTokens || 4096;
+      const ratio = EFFORT_RATIOS[effort];
+      const budget = Math.max(1, Math.floor(maxTokens * ratio));
+      currentMessage.content = [
+        "<thinking_mode>enabled</thinking_mode>",
+        `<max_thinking_length>${budget}</max_thinking_length>`,
+        `<thinking_instruction>${THINKING_INSTRUCTION}</thinking_instruction>`,
+        "",
+        currentMessage.content,
+      ].join("\n");
+    }
+  }
+
   const payload: KiroRequestPayload = {
     conversationState: {
       chatTriggerType: "MANUAL",
@@ -199,6 +302,7 @@ export function buildKiroRequest(
       currentMessage: { userInputMessage: currentMessage },
       ...(history.length ? { history } : {}),
     },
+    ...(additionalModelRequestFields ? { additionalModelRequestFields } : {}),
   };
   return { payload, registry, omittedTools: catalog.omitted };
 }

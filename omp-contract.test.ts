@@ -1,0 +1,143 @@
+// Drives the extension through OMP's real custom-API dispatch (pi-ai
+// `registerCustomApi` + `streamSimple`), the same path a registered provider
+// takes at runtime: loop guard, in-flight limiter, and OMP's own types. Only the
+// Kiro HTTP endpoint is replaced, through the `fetch` option OMP forwards.
+import { expect, test } from "bun:test";
+import {
+  type AssistantMessage,
+  type AssistantMessageEventStream,
+  type Context,
+  Effort,
+  type Model,
+  registerCustomApi,
+  streamSimple,
+  type Tool,
+} from "@oh-my-pi/pi-ai";
+import { encodeEventFrame, framesToChunkedResponse } from "./eventstream";
+import { streamKiro } from "./stream";
+import type { KiroRequestPayload, OmpContext, StreamOptionsLike } from "./types";
+
+const API = "kiro-codewhisperer-stream";
+// OMP accepts any async iterable with `result()` here (the extension ships no
+// pi-ai dependency); the cast is the extension's structural stand-in, which the
+// assertions below exercise at runtime.
+registerCustomApi(API, (model, context, options) =>
+  streamKiro(model, context as OmpContext, options as StreamOptionsLike) as unknown as AssistantMessageEventStream);
+
+const model = {
+  id: "claude-opus-5.5",
+  name: "Claude Opus 5.5",
+  api: API,
+  provider: "kiro-native",
+  baseUrl: "https://runtime.us-east-1.kiro.dev/",
+  reasoning: true,
+  input: ["text"],
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  contextWindow: 1_000_000,
+  maxTokens: 32_000,
+} as Model;
+
+const bash: Tool = {
+  name: "bash",
+  description: "Run a shell command",
+  parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] },
+} as Tool;
+
+function kiroEndpoint(responses: Array<Uint8Array[]>) {
+  const bodies: KiroRequestPayload[] = [];
+  const fetchImpl = Object.assign(async (_url: RequestInfo | URL, init?: RequestInit) => {
+    bodies.push(JSON.parse(String(init?.body)));
+    const frames = responses.shift();
+    if (!frames) throw new Error("unexpected extra Kiro request");
+    return framesToChunkedResponse(frames);
+  }, { preconnect: globalThis.fetch.preconnect });
+  return { bodies, fetch: fetchImpl };
+}
+
+test("an OMP tool turn round-trips through streamSimple with the calls OMP executes", async () => {
+  const endpoint = kiroEndpoint([
+    [
+      encodeEventFrame("assistantResponseEvent", { content: "Running it." }),
+      encodeEventFrame("toolUseEvent", { toolUseId: "tooluse_1", name: "bash", input: '{"command":"echo hi"}', stop: true }),
+    ],
+    [encodeEventFrame("assistantResponseEvent", { content: "It printed hi." })],
+  ]);
+  const context: Context = {
+    systemPrompt: ["You are terse."],
+    tools: [bash],
+    messages: [{ role: "user", content: "run echo hi", timestamp: 1 }],
+  };
+  const options = { apiKey: "access-token", reasoning: Effort.High, fetch: endpoint.fetch };
+
+  const first = await streamSimple(model, context, options).result();
+  expect(first.stopReason).toBe("toolUse");
+  expect(first.content).toEqual([
+    { type: "text", text: "Running it." },
+    { type: "toolCall", id: "tooluse_1", name: "bash", arguments: { command: "echo hi" } },
+  ]);
+  expect(endpoint.bodies[0].additionalModelRequestFields).toEqual({ output_config: { effort: "high" } });
+
+  context.messages.push(first, {
+    role: "toolResult", toolCallId: "tooluse_1", toolName: "bash",
+    content: [{ type: "text", text: "hi\n" }], isError: false, timestamp: 3,
+  });
+  const second = await streamSimple(model, context, options).result();
+  expect(second.stopReason).toBe("stop");
+  expect(second.content).toEqual([{ type: "text", text: "It printed hi." }]);
+  expect(endpoint.bodies[1].conversationState.currentMessage.userInputMessage.userInputMessageContext?.toolResults)
+    .toEqual([{ toolUseId: "tooluse_1", status: "success", content: [{ text: "hi\n" }] }]);
+});
+
+test("a session resumed after an aborted tool call sends a paired, valid history", async () => {
+  const endpoint = kiroEndpoint([[encodeEventFrame("assistantResponseEvent", { content: "OK" })]]);
+  const aborted: AssistantMessage = {
+    role: "assistant",
+    content: [{ type: "toolCall", id: "tooluse_cut", name: "bash", arguments: { command: "sleep 99" } }],
+    api: API, provider: "kiro-native", model: model.id, stopReason: "aborted", errorMessage: "Request was aborted",
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    timestamp: 2,
+  };
+  const context: Context = {
+    tools: [bash],
+    messages: [
+      { role: "user", content: "wait a bit", timestamp: 1 },
+      aborted,
+      { role: "user", content: "never mind, say OK", timestamp: 3 },
+    ],
+  };
+  const result = await streamSimple(model, context, { apiKey: "access-token", fetch: endpoint.fetch }).result();
+  expect(result.stopReason).toBe("stop");
+  const { history = [], currentMessage } = endpoint.bodies[0].conversationState;
+  expect(history[1].assistantResponseMessage?.toolUses?.map(use => use.toolUseId)).toEqual(["tooluse_cut"]);
+  expect(currentMessage.userInputMessage.content).toBe("never mind, say OK");
+  expect(currentMessage.userInputMessage.userInputMessageContext?.toolResults)
+    .toEqual([{ toolUseId: "tooluse_cut", status: "error", content: [{ text: "aborted" }] }]);
+});
+
+test("a forced tool choice from OMP reaches Kiro as a narrowed catalog, not an error", async () => {
+  const endpoint = kiroEndpoint([[
+    encodeEventFrame("toolUseEvent", { toolUseId: "tooluse_y", name: "yield", input: '{"result":"done"}', stop: true }),
+  ]]);
+  const yieldTool = { name: "yield", description: "Finish", parameters: { type: "object", properties: {} } } as Tool;
+  const context: Context = { tools: [bash, yieldTool], messages: [{ role: "user", content: "finish", timestamp: 1 }] };
+  const result = await streamSimple(model, context, {
+    apiKey: "access-token", fetch: endpoint.fetch, toolChoice: { type: "tool", name: "yield" },
+  }).result();
+  expect(result.stopReason).toBe("toolUse");
+  expect(endpoint.bodies[0].conversationState.currentMessage.userInputMessage.userInputMessageContext?.tools
+    ?.map(tool => tool.toolSpecification.name)).toEqual(["yield"]);
+});
+
+test("Kiro rejecting the model surfaces as an OMP error result with the HTTP status", async () => {
+  const fetchImpl = Object.assign(async () => new Response(
+    JSON.stringify({ __type: "com.amazon.kiro.runtimeservice#ValidationException", reason: "INVALID_MODEL_ID" }),
+    { status: 400 },
+  ), { preconnect: globalThis.fetch.preconnect });
+  const result = await streamSimple(model, { messages: [{ role: "user", content: "hi", timestamp: 1 }] }, {
+    apiKey: "access-token", fetch: fetchImpl,
+  }).result();
+  expect(result.stopReason).toBe("error");
+  expect(result.errorStatus).toBe(400);
+  expect(result.errorMessage).toContain("INVALID_MODEL_ID");
+});

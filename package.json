@@ -8,6 +8,7 @@
     "check": "tsc --noEmit"
   },
   "devDependencies": {
+    "@oh-my-pi/pi-ai": "18.4.3",
     "@types/bun": "^1.3.14",
     "typescript": "^5.9.3"
   }

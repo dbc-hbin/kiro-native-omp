@@ -1,9 +1,9 @@
+import { BUILDER_ID_SERVICE_PROFILE_ARN } from "./constants";
 import { decodeEventStream } from "./eventstream";
 import { buildKiroRequest } from "./messages";
 import type { JsonRecord, ModelLike, OmpAssistantEvent, OmpAssistantMessage, OmpContext, OmpContent, OmpUsage, StreamOptionsLike } from "./types";
 
 const TARGET = "AmazonCodeWhispererStreamingService.GenerateAssistantResponse";
-const BUILDER_ID_SERVICE_PROFILE_ARN = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
 const textDecoder = new TextDecoder();
 
 function emptyUsage(): OmpUsage {
@@ -112,7 +112,7 @@ export function streamKiro(model: ModelLike, context: OmpContext, options?: Stre
         ? `aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17975 os/${process.platform === "win32" ? "windows" : process.platform === "darwin" ? "macos" : "linux"} lang/rust/1.92.0 m/F app/AmazonQ-For-CLI`
         : undefined;
 
-      const response = await fetch(`https://runtime.${auth.region}.kiro.dev/`, {
+      const response = await (options?.fetch ?? fetch)(`https://runtime.${auth.region}.kiro.dev/`, {
         method: "POST", redirect: "error", signal: options?.signal,
         headers: {
           "content-type": "application/x-amz-json-1.0",
