@@ -33,6 +33,8 @@ Requests go to `https://runtime.<apiRegion>.kiro.dev/` with `AmazonCodeWhisperer
 
 Successful responses retain the outbound conversation ID unless Kiro supplies a valid replacement, so tool-result turns continue even without response metadata. A response containing only reasoning and no answer or tool call is reported as an error, not a completed turn.
 
+Kiro's per-user request-rate throttle (HTTP 429 `ThrottlingException`, e.g. `USER_REQUEST_RATE_EXCEEDED`) is retried inside the provider up to 3 sends, waiting for `Retry-After` or 2s then 4s. A 429 naming an exhausted quota (`MONTHLY_REQUEST_COUNT`), or a server wait longer than OMP's `maxRetryDelayMs` (60s by default), fails immediately so OMP's own retry and model fallback take over.
+
 OMP passes custom providers the raw session history, so the request builder applies the same tool pairing OMP's built-in providers get: every replayed tool call is answered in the next user turn, a call without a result gets an error result (`No result provided`, or `aborted` after an aborted/failed turn), duplicate results are dropped, and a result whose call was compacted away is kept as a `<stale-tool-result>` note. Kiro has no tool-choice field, so `toolChoice: "none"` offers no tools, a named choice offers only that tool, and `any`/`required` offer every tool; forced choices therefore do not fail the request, but the model may still answer without calling a tool.
 
 ## Development

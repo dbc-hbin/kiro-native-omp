@@ -5,6 +5,38 @@ import type { JsonRecord, ModelLike, OmpAssistantEvent, OmpAssistantMessage, Omp
 
 const TARGET = "AmazonCodeWhispererStreamingService.GenerateAssistantResponse";
 const textDecoder = new TextDecoder();
+// Kiro's per-user request-rate throttle (HTTP 429, USER_REQUEST_RATE_EXCEEDED)
+// clears within seconds. Like OpenCodex, retry it inside the provider instead of
+// failing the turn; exhausted quotas are not retryable.
+const MAX_SEND_ATTEMPTS = 3;
+const THROTTLE_BASE_DELAY_MS = 2_000;
+const DEFAULT_MAX_RETRY_DELAY_MS = 60_000;
+const QUOTA_EXHAUSTED = /MONTHLY_REQUEST_COUNT|quota/i;
+
+function retryAfterMs(value: string | null): number | undefined {
+  if (!value?.trim()) return undefined;
+  const seconds = Number(value);
+  if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000;
+  const at = Date.parse(value);
+  return Number.isNaN(at) ? undefined : Math.max(0, at - Date.now());
+}
+
+function waitForRetry(delayMs: number, options?: StreamOptionsLike): Promise<void> {
+  if (options?.providerRetryWait) return options.providerRetryWait(delayMs, options.signal);
+  const signal = options?.signal;
+  if (signal?.aborted) return Promise.reject(new Error("Request was aborted"));
+  const { promise, resolve, reject } = Promise.withResolvers<void>();
+  const onAbort = () => {
+    clearTimeout(timer);
+    reject(new Error("Request was aborted"));
+  };
+  const timer = setTimeout(() => {
+    signal?.removeEventListener("abort", onAbort);
+    resolve();
+  }, delayMs);
+  signal?.addEventListener("abort", onAbort, { once: true });
+  return promise;
+}
 
 function emptyUsage(): OmpUsage {
   return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
@@ -112,28 +144,41 @@ export function streamKiro(model: ModelLike, context: OmpContext, options?: Stre
         ? `aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17975 os/${process.platform === "win32" ? "windows" : process.platform === "darwin" ? "macos" : "linux"} lang/rust/1.92.0 m/F app/AmazonQ-For-CLI`
         : undefined;
 
-      const response = await (options?.fetch ?? fetch)(`https://runtime.${auth.region}.kiro.dev/`, {
-        method: "POST", redirect: "error", signal: options?.signal,
-        headers: {
-          "content-type": "application/x-amz-json-1.0",
-          accept: wireClient === "cli" ? "*/*" : "application/vnd.amazon.eventstream",
-          authorization: `Bearer ${auth.token}`,
-          "x-amz-target": TARGET,
-          ...(profileArn ? { "x-amzn-kiro-profile-arn": profileArn } : {}),
-          "x-amzn-codewhisperer-optout": "true",
-          "amz-sdk-invocation-id": crypto.randomUUID(),
-          ...(cliAgent ? {
-            "user-agent": cliAgent.replace(" m/F", " md/appVersion-2.14.2 m/F"),
-            "x-amz-user-agent": cliAgent,
-            "amz-sdk-request": "attempt=1; max=3",
-          } : {
-            "user-agent": "aws-sdk-js/1.0.27 ua/2.1 api/codewhispererstreaming#1.0.27 m/E KiroIDE-1.0.0",
-            "x-amz-user-agent": "aws-sdk-js/1.0.27 KiroIDE-1.0.0",
-            "x-amzn-kiro-agent-mode": "vibe",
-          }),
-        },
-        body: JSON.stringify(built.payload),
-      });
+      const body = JSON.stringify(built.payload);
+      const maxRetryDelayMs = options?.maxRetryDelayMs ?? DEFAULT_MAX_RETRY_DELAY_MS;
+      let response: Response;
+      for (let attempt = 1; ; attempt++) {
+        response = await (options?.fetch ?? fetch)(`https://runtime.${auth.region}.kiro.dev/`, {
+          method: "POST", redirect: "error", signal: options?.signal,
+          headers: {
+            "content-type": "application/x-amz-json-1.0",
+            accept: wireClient === "cli" ? "*/*" : "application/vnd.amazon.eventstream",
+            authorization: `Bearer ${auth.token}`,
+            "x-amz-target": TARGET,
+            ...(profileArn ? { "x-amzn-kiro-profile-arn": profileArn } : {}),
+            "x-amzn-codewhisperer-optout": "true",
+            "amz-sdk-invocation-id": crypto.randomUUID(),
+            ...(cliAgent ? {
+              "user-agent": cliAgent.replace(" m/F", " md/appVersion-2.14.2 m/F"),
+              "x-amz-user-agent": cliAgent,
+              "amz-sdk-request": `attempt=${attempt}; max=${MAX_SEND_ATTEMPTS}`,
+            } : {
+              "user-agent": "aws-sdk-js/1.0.27 ua/2.1 api/codewhispererstreaming#1.0.27 m/E KiroIDE-1.0.0",
+              "x-amz-user-agent": "aws-sdk-js/1.0.27 KiroIDE-1.0.0",
+              "x-amzn-kiro-agent-mode": "vibe",
+            }),
+          },
+          body,
+        });
+        if (response.status !== 429 || attempt === MAX_SEND_ATTEMPTS) break;
+        const errorText = await response.text();
+        const delayMs = retryAfterMs(response.headers.get("retry-after")) ?? THROTTLE_BASE_DELAY_MS * 2 ** (attempt - 1);
+        if (QUOTA_EXHAUSTED.test(errorText) || (maxRetryDelayMs > 0 && delayMs > maxRetryDelayMs)) {
+          response = new Response(errorText, { status: response.status, headers: response.headers });
+          break;
+        }
+        await waitForRetry(delayMs, options);
+      }
       if (!response.ok) {
         message.errorStatus = response.status;
         throw new Error(`Kiro CodeWhisperer HTTP ${response.status}: ${(await response.text()).slice(0, 1000)}`);

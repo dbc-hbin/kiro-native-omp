@@ -53,6 +53,10 @@ export interface StreamOptionsLike {
   signal?: AbortSignal;
   /** OMP routes provider HTTP through this override when set. */
   fetch?: typeof fetch;
+  /** OMP cap on a server-requested retry wait; 0 disables it. Defaults to 60s. */
+  maxRetryDelayMs?: number;
+  /** OMP hook that replaces the provider's own retry sleep. */
+  providerRetryWait?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
   toolChoice?:
     | "auto"
     | "none"

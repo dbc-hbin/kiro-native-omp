@@ -141,3 +141,65 @@ test("Kiro rejecting the model surfaces as an OMP error result with the HTTP sta
   expect(result.errorStatus).toBe(400);
   expect(result.errorMessage).toContain("INVALID_MODEL_ID");
 });
+
+const throttled = (headers: Record<string, string> = {}, reason = "USER_REQUEST_RATE_EXCEEDED") => new Response(
+  JSON.stringify({ __type: "com.amazon.kiro.runtimeservice#ThrottlingException", message: "Too many requests, please wait before trying again.", reason }),
+  { status: 429, headers },
+);
+
+function scriptedFetch(responses: Array<() => Response>) {
+  const attempts: string[] = [];
+  const fetchImpl = Object.assign(async (_url: RequestInfo | URL, init?: RequestInit) => {
+    attempts.push(new Headers(init?.headers).get("amz-sdk-request") ?? "");
+    const next = responses.shift();
+    if (!next) throw new Error("unexpected extra Kiro request");
+    return next();
+  }, { preconnect: globalThis.fetch.preconnect });
+  return { attempts, fetch: fetchImpl };
+}
+
+test("a transient Kiro rate limit is retried inside the provider and the turn completes", async () => {
+  const endpoint = scriptedFetch([
+    () => throttled({ "retry-after": "3" }),
+    () => throttled(),
+    () => framesToChunkedResponse([encodeEventFrame("assistantResponseEvent", { content: "OK" })]),
+  ]);
+  const waits: number[] = [];
+  const result = await streamSimple(model, { messages: [{ role: "user", content: "hi", timestamp: 1 }] }, {
+    apiKey: "access-token", fetch: endpoint.fetch,
+    providerRetryWait: async delayMs => { waits.push(delayMs); },
+  }).result();
+  expect(result.stopReason).toBe("stop");
+  expect(result.content).toEqual([{ type: "text", text: "OK" }]);
+  // Server Retry-After wins; otherwise exponential backoff from 2s.
+  expect(waits).toEqual([3_000, 4_000]);
+  expect(endpoint.attempts).toEqual(["attempt=1; max=3", "attempt=2; max=3", "attempt=3; max=3"]);
+});
+
+test("a rate limit that outlasts the retry budget reaches OMP as a 429 error", async () => {
+  const endpoint = scriptedFetch([() => throttled(), () => throttled(), () => throttled()]);
+  const result = await streamSimple(model, { messages: [{ role: "user", content: "hi", timestamp: 1 }] }, {
+    apiKey: "access-token", fetch: endpoint.fetch, providerRetryWait: async () => {},
+  }).result();
+  expect(result.stopReason).toBe("error");
+  expect(result.errorStatus).toBe(429);
+  expect(result.errorMessage).toContain("USER_REQUEST_RATE_EXCEEDED");
+  expect(endpoint.attempts).toHaveLength(3);
+});
+
+test("an exhausted monthly quota and a wait beyond OMP's cap are not retried", async () => {
+  for (const [response, options] of [
+    [() => throttled({}, "MONTHLY_REQUEST_COUNT"), {}],
+    [() => throttled({ "retry-after": "120" }), { maxRetryDelayMs: 60_000 }],
+  ] as const) {
+    const endpoint = scriptedFetch([response]);
+    let waited = false;
+    const result = await streamSimple(model, { messages: [{ role: "user", content: "hi", timestamp: 1 }] }, {
+      apiKey: "access-token", fetch: endpoint.fetch, ...options,
+      providerRetryWait: async () => { waited = true; },
+    }).result();
+    expect(result.errorStatus).toBe(429);
+    expect(waited).toBe(false);
+    expect(endpoint.attempts).toHaveLength(1);
+  }
+});
