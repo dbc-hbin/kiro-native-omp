@@ -4,6 +4,9 @@ import { buildKiroRequest } from "./messages";
 import type { JsonRecord, ModelLike, OmpAssistantEvent, OmpAssistantMessage, OmpContext, OmpContent, OmpUsage, StreamOptionsLike } from "./types";
 
 const TARGET = "AmazonCodeWhispererStreamingService.GenerateAssistantResponse";
+// Match CLI 2.26.0 first-request headers without accumulating appVersion tags on retries.
+const CLI_AMZ_USER_AGENT = `aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17975 os/${process.platform === "win32" ? "windows" : process.platform === "darwin" ? "macos" : "linux"} lang/rust/1.92.0 m/F app/AmazonQ-For-CLI`;
+const CLI_USER_AGENT = CLI_AMZ_USER_AGENT.replace(" m/F", " md/appVersion-2.26.0");
 const textDecoder = new TextDecoder();
 // Kiro's per-user request-rate throttle (HTTP 429, USER_REQUEST_RATE_EXCEEDED)
 // clears within seconds. Like OpenCodex, retry it inside the provider instead of
@@ -140,12 +143,10 @@ export function streamKiro(model: ModelLike, context: OmpContext, options?: Stre
       const profileArn = ownProfileArn ?? (builderFallback ? BUILDER_ID_SERVICE_PROFILE_ARN : undefined);
       const built = buildKiroRequest(context, model.id, options, ["eval"], wireClient);
       if (profileArn) built.payload.profileArn = profileArn;
-      const cliAgent = wireClient === "cli"
-        ? `aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17975 os/${process.platform === "win32" ? "windows" : process.platform === "darwin" ? "macos" : "linux"} lang/rust/1.92.0 m/F app/AmazonQ-For-CLI`
-        : undefined;
 
       const body = JSON.stringify(built.payload);
       const maxRetryDelayMs = options?.maxRetryDelayMs ?? DEFAULT_MAX_RETRY_DELAY_MS;
+      const invocationId = crypto.randomUUID();
       let response: Response;
       for (let attempt = 1; ; attempt++) {
         response = await (options?.fetch ?? fetch)(`https://runtime.${auth.region}.kiro.dev/`, {
@@ -155,12 +156,14 @@ export function streamKiro(model: ModelLike, context: OmpContext, options?: Stre
             accept: wireClient === "cli" ? "*/*" : "application/vnd.amazon.eventstream",
             authorization: `Bearer ${auth.token}`,
             "x-amz-target": TARGET,
-            ...(profileArn ? { "x-amzn-kiro-profile-arn": profileArn } : {}),
+            ...(wireClient === "ide" && profileArn ? { "x-amzn-kiro-profile-arn": profileArn } : {}),
             "x-amzn-codewhisperer-optout": "true",
-            "amz-sdk-invocation-id": crypto.randomUUID(),
-            ...(cliAgent ? {
-              "user-agent": cliAgent.replace(" m/F", " md/appVersion-2.14.2 m/F"),
-              "x-amz-user-agent": cliAgent,
+            "amz-sdk-invocation-id": invocationId,
+            ...(wireClient === "cli" ? {
+              "user-agent": CLI_USER_AGENT,
+              "x-amz-user-agent": CLI_AMZ_USER_AGENT,
+              "accept-encoding": "gzip",
+              "x-kiro-attempt": `${attempt};max=${MAX_SEND_ATTEMPTS}`,
               "amz-sdk-request": `attempt=${attempt}; max=${MAX_SEND_ATTEMPTS}`,
             } : {
               "user-agent": "aws-sdk-js/1.0.27 ua/2.1 api/codewhispererstreaming#1.0.27 m/E KiroIDE-1.0.0",

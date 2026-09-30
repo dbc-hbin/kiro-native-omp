@@ -16,7 +16,6 @@ import type {
 } from "./types";
 
 const CONTINUATION = "Continue from the prior conversation. Do not quote or mention this instruction.";
-const RESULT_CARRIER = "The requested tool result is attached.";
 const EMPTY_RESULT = "The tool completed without textual output.";
 // Same placeholders OMP's transformMessages synthesizes for built-in providers.
 const MISSING_RESULT = "No result provided";
@@ -219,7 +218,6 @@ export function buildKiroRequest(
 
   if (turns.length === 0 || turns[0].kind === "assistant") turns.unshift({ kind: "user", content: CONTINUATION, toolResults: [] });
   if (turns.at(-1)?.kind === "assistant") turns.push({ kind: "user", content: CONTINUATION, toolResults: [] });
-  for (const turn of turns) if (turn.kind === "user" && !turn.content.trim() && turn.toolResults.length > 0) turn.content = RESULT_CARRIER;
 
   const current = turns.pop();
   if (!current || current.kind !== "user") throw new Error("Kiro request must end with a user turn");
@@ -238,17 +236,20 @@ export function buildKiroRequest(
     : {
         userInputMessage: {
           content: turn.content,
-          modelId: wireModelId,
           origin: wireClient === "cli" ? "KIRO_CLI" : "AI_EDITOR",
           ...(turn.toolResults.length ? { userInputMessageContext: { toolResults: turn.toolResults } } : {}),
         },
       };
   const history = turns.map(toEntry);
-  const currentMessage: KiroUserInputMessage = {
+  const currentMessage: KiroUserInputMessage & { modelId: string } = {
     content: current.content,
     modelId: wireModelId,
     origin: wireClient === "cli" ? "KIRO_CLI" : "AI_EDITOR",
     userInputMessageContext: {
+      envState: {
+        operatingSystem: process.platform === "darwin" ? "macos" : process.platform === "win32" ? "windows" : process.platform,
+        currentWorkingDirectory: options?.cwd ?? process.cwd(),
+      },
       ...(current.toolResults.length ? { toolResults: current.toolResults } : {}),
       ...(catalog.tools.length ? { tools: catalog.tools } : {}),
     },
@@ -297,7 +298,7 @@ export function buildKiroRequest(
   const payload: KiroRequestPayload = {
     conversationState: {
       chatTriggerType: "MANUAL",
-      ...(wireClient === "cli" ? { agentContinuationId: randomUUID(), agentTaskType: "vibe" as const } : {}),
+      ...(wireClient === "cli" ? { agentTaskType: "vibe" as const } : {}),
       conversationId: conversationId(context),
       currentMessage: { userInputMessage: currentMessage },
       ...(history.length ? { history } : {}),

@@ -144,7 +144,7 @@ describe("Kiro native OMP translation", () => {
     const built = buildKiroRequest(context, "gpt-5.6-sol", undefined, ["kiro_mock_probe"]);
     validateKiroConversation(built.payload);
     const { history, currentMessage } = built.payload.conversationState;
-    expect(history?.[0].userInputMessage).toEqual({ content: "system\n\ngo", origin: "KIRO_CLI", modelId: "gpt-5.6-sol" });
+    expect(history?.[0].userInputMessage).toEqual({ content: "system\n\ngo", origin: "KIRO_CLI" });
     expect(history?.[1].assistantResponseMessage).toEqual({
       content: "",
       toolUses: [{ toolUseId: "call-1", name: "kiro_mock_probe", input: {} }],

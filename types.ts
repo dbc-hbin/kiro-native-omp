@@ -51,6 +51,8 @@ export interface ModelLike {
 export interface StreamOptionsLike {
   apiKey?: string;
   signal?: AbortSignal;
+  /** OMP session workspace; falls back to the process working directory. */
+  cwd?: string;
   /** OMP routes provider HTTP through this override when set. */
   fetch?: typeof fetch;
   /** OMP cap on a server-requested retry wait; 0 disables it. Defaults to 60s. */
@@ -94,9 +96,13 @@ export interface KiroToolResult {
 
 export interface KiroUserInputMessage {
   content: string;
-  modelId: string;
+  modelId?: string;
   origin: "KIRO_CLI" | "AI_EDITOR";
   userInputMessageContext?: {
+    envState?: {
+      operatingSystem: string;
+      currentWorkingDirectory: string;
+    };
     tools?: KiroToolSpecification[];
     toolResults?: KiroToolResult[];
   };
@@ -117,9 +123,8 @@ export interface KiroRequestPayload {
   conversationState: {
     chatTriggerType: "MANUAL";
     conversationId: string;
-    agentContinuationId?: string;
     agentTaskType?: "vibe";
-    currentMessage: { userInputMessage: KiroUserInputMessage };
+    currentMessage: { userInputMessage: KiroUserInputMessage & { modelId: string } };
     history?: KiroHistoryEntry[];
   };
   profileArn?: string;

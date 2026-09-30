@@ -3,6 +3,7 @@
 // takes at runtime: loop guard, in-flight limiter, and OMP's own types. Only the
 // Kiro HTTP endpoint is replaced, through the `fetch` option OMP forwards.
 import { expect, test } from "bun:test";
+import { tmpdir } from "node:os";
 import {
   type AssistantMessage,
   type AssistantMessageEventStream,
@@ -67,7 +68,7 @@ test("an OMP tool turn round-trips through streamSimple with the calls OMP execu
     tools: [bash],
     messages: [{ role: "user", content: "run echo hi", timestamp: 1 }],
   };
-  const options = { apiKey: "access-token", reasoning: Effort.High, fetch: endpoint.fetch };
+  const options = { apiKey: "access-token", reasoning: Effort.High, fetch: endpoint.fetch, cwd: tmpdir() };
 
   const first = await streamSimple(model, context, options).result();
   expect(first.stopReason).toBe("toolUse");
@@ -84,6 +85,10 @@ test("an OMP tool turn round-trips through streamSimple with the calls OMP execu
   const second = await streamSimple(model, context, options).result();
   expect(second.stopReason).toBe("stop");
   expect(second.content).toEqual([{ type: "text", text: "It printed hi." }]);
+  const state = endpoint.bodies[1].conversationState;
+  expect(state.conversationId).toBe(endpoint.bodies[0].conversationState.conversationId);
+  expect(state.currentMessage.userInputMessage.content).toBe("");
+  expect(state.currentMessage.userInputMessage.userInputMessageContext?.envState?.currentWorkingDirectory).toBe(options.cwd);
   expect(endpoint.bodies[1].conversationState.currentMessage.userInputMessage.userInputMessageContext?.toolResults)
     .toEqual([{ toolUseId: "tooluse_1", status: "success", content: [{ text: "hi\n" }] }]);
 });
@@ -149,13 +154,16 @@ const throttled = (headers: Record<string, string> = {}, reason = "USER_REQUEST_
 
 function scriptedFetch(responses: Array<() => Response>) {
   const attempts: string[] = [];
+  const invocationIds: Array<string | null> = [];
   const fetchImpl = Object.assign(async (_url: RequestInfo | URL, init?: RequestInit) => {
-    attempts.push(new Headers(init?.headers).get("amz-sdk-request") ?? "");
+    const headers = new Headers(init?.headers);
+    attempts.push(headers.get("amz-sdk-request") ?? "");
+    invocationIds.push(headers.get("amz-sdk-invocation-id"));
     const next = responses.shift();
     if (!next) throw new Error("unexpected extra Kiro request");
     return next();
   }, { preconnect: globalThis.fetch.preconnect });
-  return { attempts, fetch: fetchImpl };
+  return { attempts, invocationIds, fetch: fetchImpl };
 }
 
 test("a transient Kiro rate limit is retried inside the provider and the turn completes", async () => {
@@ -163,6 +171,7 @@ test("a transient Kiro rate limit is retried inside the provider and the turn co
     () => throttled({ "retry-after": "3" }),
     () => throttled(),
     () => framesToChunkedResponse([encodeEventFrame("assistantResponseEvent", { content: "OK" })]),
+    () => framesToChunkedResponse([encodeEventFrame("assistantResponseEvent", { content: "Next" })]),
   ]);
   const waits: number[] = [];
   const result = await streamSimple(model, { messages: [{ role: "user", content: "hi", timestamp: 1 }] }, {
@@ -174,6 +183,15 @@ test("a transient Kiro rate limit is retried inside the provider and the turn co
   // Server Retry-After wins; otherwise exponential backoff from 2s.
   expect(waits).toEqual([3_000, 4_000]);
   expect(endpoint.attempts).toEqual(["attempt=1; max=3", "attempt=2; max=3", "attempt=3; max=3"]);
+  const invocationId = endpoint.invocationIds[0];
+  expect(invocationId).toEqual(expect.any(String));
+  expect(endpoint.invocationIds).toEqual([invocationId, invocationId, invocationId]);
+
+  const next = await streamSimple(model, { messages: [{ role: "user", content: "next", timestamp: 2 }] }, {
+    apiKey: "access-token", fetch: endpoint.fetch,
+  }).result();
+  expect(next.content).toEqual([{ type: "text", text: "Next" }]);
+  expect(endpoint.invocationIds[3]).not.toBe(invocationId);
 });
 
 test("a rate limit that outlasts the retry budget reaches OMP as a 429 error", async () => {

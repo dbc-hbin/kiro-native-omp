@@ -46,7 +46,8 @@ test("Builder ID sends the selected model, request-scoped service profile, and K
     expect(headers.get("accept")).toBe("*/*");
     expect(headers.get("content-type")).toBe("application/x-amz-json-1.0");
     expect(headers.get("x-amz-target")).toBe("AmazonCodeWhispererStreamingService.GenerateAssistantResponse");
-    expect(headers.get("x-amzn-kiro-profile-arn")).toBe("arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX");
+    expect(headers.get("x-amzn-kiro-profile-arn")).toBeNull();
+    expect(headers.get("x-amzn-codewhisperer-optout")).toBe("true");
     const body = String(init?.body);
     expect(body).not.toContain("secret-refresh");
     expect(body).not.toContain("private-client-secret");
@@ -56,11 +57,9 @@ test("Builder ID sends the selected model, request-scoped service profile, and K
     expect(state.chatTriggerType).toBe("MANUAL");
     expect(request.profileArn).toBe("arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX");
     expect(state.agentTaskType).toBe("vibe");
-    expect(typeof state.agentContinuationId).toBe("string");
     expect(state.history[0].userInputMessage.content).toBe("System instruction\n\ncall it");
     expect(state.history[1].assistantResponseMessage.toolUses[0].name).toMatch(/^mcp_tool_with_spaces_[a-f0-9]{8}$/);
     expect(state.history[1].assistantResponseMessage.toolUses[0].input).toEqual({ x: "yes" });
-    expect(state.history[0].userInputMessage.modelId).toBe("claude-haiku-4.5");
     expect(state.currentMessage.userInputMessage.modelId).toBe("claude-haiku-4.5");
     expect(state.currentMessage.userInputMessage.origin).toBe("KIRO_CLI");
     expect(state.currentMessage.userInputMessage.userInputMessageContext.tools[0].toolSpecification.name).toMatch(/^mcp_tool_with_spaces_[a-f0-9]{8}$/);
@@ -80,7 +79,7 @@ test("Builder ID sends the selected model, request-scoped service profile, and K
   expect(message.responseId).toBe("server-id");
 });
 
-test("changing selected models routes current and previous user turns, while Auto remains Auto", async () => {
+test("changing selected models routes the current turn, while Auto remains Auto", async () => {
   const ctx: OmpContext = { messages: [
     { role: "user", content: "First question" },
     { role: "assistant", content: [{ type: "text", text: "First answer" }] },
@@ -88,16 +87,11 @@ test("changing selected models routes current and previous user turns, while Aut
     { role: "assistant", content: [{ type: "text", text: "Second answer" }] },
     { role: "user", content: "Follow-up" },
   ] };
-  const outbound: Array<{ current: string; history: string[]; origins: string[]; conversationId: string }> = [];
+  const outbound: Array<{ current: string; conversationId: string }> = [];
   fetchSpy = spyOn(globalThis, "fetch").mockImplementation(Object.assign(async (_url: RequestInfo | URL, init?: RequestInit) => {
     const state = JSON.parse(String(init?.body)).conversationState;
-    const users: Array<{ modelId: string; origin: string }> = state.history.flatMap(
-      (entry: { userInputMessage?: { modelId: string; origin: string } }) => entry.userInputMessage ? [entry.userInputMessage] : [],
-    );
     outbound.push({
       current: state.currentMessage.userInputMessage.modelId,
-      history: users.map(user => user.modelId),
-      origins: users.map(user => user.origin),
       conversationId: state.conversationId,
     });
     return framesToChunkedResponse([encodeEventFrame("assistantResponseEvent", { content: "Answer from Kiro" })]);
@@ -107,11 +101,7 @@ test("changing selected models routes current and previous user turns, while Aut
     expect(message.content).toEqual([{ type: "text", text: "Answer from Kiro" }]);
     expect(message.stopReason).toBe("stop");
   }
-  expect(outbound.map(({ conversationId: _conversationId, ...turns }) => turns)).toEqual([
-    { current: "gpt-5.6-sol", history: ["gpt-5.6-sol", "gpt-5.6-sol"], origins: ["KIRO_CLI", "KIRO_CLI"] },
-    { current: "claude-opus-5", history: ["claude-opus-5", "claude-opus-5"], origins: ["KIRO_CLI", "KIRO_CLI"] },
-    { current: "auto", history: ["auto", "auto"], origins: ["KIRO_CLI", "KIRO_CLI"] },
-  ]);
+  expect(outbound.map(turn => turn.current)).toEqual(["gpt-5.6-sol", "claude-opus-5", "auto"]);
   expect(outbound[0].conversationId).not.toBe(outbound[1].conversationId);
   expect(outbound[1].conversationId).not.toBe(outbound[2].conversationId);
 });
@@ -132,7 +122,6 @@ test("enterprise credential uses its own profile and IDE wire without CLI contin
     expect(request.profileArn).toBe(profileArn);
     expect(request.conversationState.currentMessage.userInputMessage.origin).toBe("AI_EDITOR");
     expect(request.conversationState.currentMessage.userInputMessage.modelId).toBe("claude-opus-5");
-    expect(request.conversationState.agentContinuationId).toBeUndefined();
     expect(request.conversationState.agentTaskType).toBeUndefined();
     return framesToChunkedResponse([encodeEventFrame("assistantResponseEvent", { content: "Enterprise reply" })]);
   }, { preconnect: globalThis.fetch.preconnect }));
@@ -496,7 +485,6 @@ test("outbound JSON leaves tool-result turn content unmodified even with effort 
 
   expect(capturedPayload?.additionalModelRequestFields).toBeUndefined();
   const current = capturedPayload?.conversationState.currentMessage.userInputMessage;
-  expect(current?.content).toBe("The requested tool result is attached.");
   expect(current?.content).not.toContain("<thinking_mode>");
   expect(current?.userInputMessageContext?.toolResults).toEqual([
     { toolUseId: "t-1", status: "success", content: [{ text: "done" }] },
