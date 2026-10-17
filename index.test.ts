@@ -245,20 +245,64 @@ describe("Kiro native OMP translation", () => {
     expect(built.payload.conversationState.currentMessage.userInputMessage.userInputMessageContext?.toolResults?.map(result => result.toolUseId)).toEqual(ids);
   });
 
-  test("fails closed instead of silently dropping unsupported images", () => {
+  test("preserves user and tool-result images without silently dropping them", () => {
     const userImage: OmpContext = {
-      messages: [{ role: "user", content: [{ type: "image", mimeType: "image/png", data: "AA==" }] }],
+      messages: [{
+        role: "user",
+        content: [{ type: "image", mimeType: "image/png", data: "AA==" }],
+      }],
     };
-    expect(() => buildKiroRequest(userImage, "gpt-5.6-sol")).toThrow(/does not translate user image/);
+    const userRequest = buildKiroRequest(userImage, "gpt-5.6-sol");
+    expect(userRequest.payload.conversationState.currentMessage.userInputMessage.images).toEqual([
+      { format: "png", source: { bytes: "AA==" } },
+    ]);
+    const historyRequest = buildKiroRequest({
+      messages: [
+        { role: "user", content: [{ type: "image", mimeType: "image/gif", data: "AQ==" }] },
+        { role: "assistant", content: [{ type: "text", text: "seen" }] },
+        { role: "user", content: [{ type: "image", mimeType: "image/webp", data: "Ag==" }] },
+      ],
+    }, "gpt-5.6-sol");
+    expect(historyRequest.payload.conversationState.history?.[0].userInputMessage?.images).toEqual([
+      { format: "gif", source: { bytes: "AQ==" } },
+    ]);
+    expect(historyRequest.payload.conversationState.currentMessage.userInputMessage.images).toEqual([
+      { format: "webp", source: { bytes: "Ag==" } },
+    ]);
     const toolImage: OmpContext = {
       tools: [{ name: "kiro_mock_probe", description: "probe", parameters: { type: "object", properties: {} } }],
       messages: [
         { role: "user", content: "go" },
         { role: "assistant", content: [{ type: "toolCall", id: "img", name: "kiro_mock_probe", arguments: {} }] },
-        { role: "toolResult", toolCallId: "img", toolName: "kiro_mock_probe", content: [{ type: "image", mimeType: "image/png", data: "AA==" }], isError: false },
+        {
+          role: "toolResult",
+          toolCallId: "img",
+          toolName: "kiro_mock_probe",
+          content: [
+            { type: "text", text: "result" },
+            { type: "image", mimeType: "image/png", data: "AA==" },
+          ],
+          isError: false,
+        },
       ],
     };
-    expect(() => buildKiroRequest(toolImage, "gpt-5.6-sol")).toThrow(/does not translate tool-result image/);
+    const toolRequest = buildKiroRequest(toolImage, "gpt-5.6-sol");
+    const current = toolRequest.payload.conversationState.currentMessage.userInputMessage;
+    expect(current.images).toEqual([{ format: "png", source: { bytes: "AA==" } }]);
+    expect(current.userInputMessageContext?.toolResults).toEqual([{
+      toolUseId: "img",
+      status: "success",
+      content: [{ text: "result" }],
+    }]);
+  });
+
+  test("rejects unsupported image MIME and noncanonical base64 at the input boundary", () => {
+    const context = (mimeType: string, data: string): OmpContext => ({
+      messages: [{ role: "user", content: [{ type: "image", mimeType, data }] }],
+    });
+    expect(() => buildKiroRequest(context("image/bmp", "AA=="), "gpt-5.6-sol")).toThrow(/MIME type/);
+    expect(() => buildKiroRequest(context("image/png", "not-base64"), "gpt-5.6-sol")).toThrow(/canonical base64/);
+    expect(() => buildKiroRequest(context("image/png", "AA"), "gpt-5.6-sol")).toThrow(/canonical base64/);
   });
 
   test("OAuth login surfaces the real AWS device authorization URL", async () => {
@@ -394,23 +438,47 @@ describe("Kiro native OMP translation", () => {
     }
   });
 
-  test("maps native output_config.effort for Opus 5 and Opus 5.5 without thinking tags", () => {
+  test("maps native thinking and output_config effort for Claude and kimi models without thinking tags", () => {
     const context: OmpContext = {
       messages: [{ role: "user", content: "Compose an essay" }],
     };
 
     const cases: Array<{ modelId: string; effort: KiroEffort }> = [
+      { modelId: "claude-opus-4.6", effort: "low" },
+      { modelId: "claude-opus-4.7", effort: "medium" },
+      { modelId: "claude-opus-4.8", effort: "high" },
       { modelId: "claude-opus-5", effort: "xhigh" },
       { modelId: "claude-opus-5.5", effort: "high" },
+      { modelId: "claude-sonnet-4.6", effort: "low" },
+      { modelId: "claude-sonnet-5", effort: "medium" },
+      { modelId: "claude-sonnet-5.5", effort: "high" },
+      { modelId: "kimi-k3", effort: "max" },
     ];
 
     for (const { modelId, effort } of cases) {
       const built = buildKiroRequest(context, modelId, { reasoning: effort });
       expect(built.payload.additionalModelRequestFields).toEqual({
+        thinking: { type: "adaptive", display: "summarized" },
         output_config: { effort },
       });
       expect(built.payload.conversationState.currentMessage.userInputMessage.content).toBe("Compose an essay");
     }
+  });
+
+  test("sends explicit reasoning off only for native GPT models", () => {
+    const context: OmpContext = {
+      messages: [{ role: "user", content: "Do not reason" }],
+    };
+    for (const modelId of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-sol", "gpt-6-luna"]) {
+      expect(buildKiroRequest(context, modelId, { disableReasoning: true }).payload.additionalModelRequestFields).toEqual({
+        reasoning: { effort: "none" },
+      });
+      expect(buildKiroRequest(context, modelId, { forceReasoningOff: true }).payload.additionalModelRequestFields).toEqual({
+        reasoning: { effort: "none" },
+      });
+    }
+    expect(buildKiroRequest(context, "claude-opus-5", { disableReasoning: true }).payload.additionalModelRequestFields).toBeUndefined();
+    expect(buildKiroRequest(context, "gpt-5.6-sol").payload.additionalModelRequestFields).toBeUndefined();
   });
 
   test("falls back to bounded thinking tags for Terra and Luna on xhigh", () => {

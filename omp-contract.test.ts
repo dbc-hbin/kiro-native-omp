@@ -76,7 +76,10 @@ test("an OMP tool turn round-trips through streamSimple with the calls OMP execu
     { type: "text", text: "Running it." },
     { type: "toolCall", id: "tooluse_1", name: "bash", arguments: { command: "echo hi" } },
   ]);
-  expect(endpoint.bodies[0].additionalModelRequestFields).toEqual({ output_config: { effort: "high" } });
+  expect(endpoint.bodies[0].additionalModelRequestFields).toEqual({
+    thinking: { type: "adaptive", display: "summarized" },
+    output_config: { effort: "high" },
+  });
 
   context.messages.push(first, {
     role: "toolResult", toolCallId: "tooluse_1", toolName: "bash",

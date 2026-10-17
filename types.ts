@@ -94,8 +94,14 @@ export interface KiroToolResult {
   toolUseId: string;
 }
 
+export interface KiroImage {
+  format: "png" | "jpeg" | "gif" | "webp";
+  source: { bytes: string };
+}
+
 export interface KiroUserInputMessage {
   content: string;
+  images?: KiroImage[];
   modelId?: string;
   origin: "KIRO_CLI" | "AI_EDITOR";
   userInputMessageContext?: {
@@ -129,7 +135,8 @@ export interface KiroRequestPayload {
   };
   profileArn?: string;
   additionalModelRequestFields?: {
-    reasoning?: { effort: KiroEffort };
+    reasoning?: { effort: KiroEffort | "none" };
+    thinking?: { type: "adaptive"; display: "summarized" };
     output_config?: { effort: KiroEffort };
   };
 }
@@ -152,6 +159,11 @@ export interface OmpUsage {
   cacheRead: number;
   cacheWrite: number;
   totalTokens: number;
+  credits?: {
+    cost?: number;
+    committedCost?: number;
+    acuCost?: number;
+  };
   cost: {
     input: number;
     output: number;
@@ -171,6 +183,8 @@ export interface OmpAssistantMessage {
   stopReason: "stop" | "length" | "toolUse" | "error" | "aborted";
   responseId?: string;
   errorStatus?: number;
+  errorId?: number;
+  errorClassificationMessage?: string;
   errorMessage?: string;
   timestamp: number;
 }

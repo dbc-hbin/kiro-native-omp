@@ -4,6 +4,7 @@ import { buildKiroRequest } from "./messages";
 import { kiroOAuthProvider } from "./oauth";
 import { streamKiro } from "./stream";
 import type { OmpAssistantEvent, OmpContext, StreamOptionsLike } from "./types";
+import { Flag } from "@oh-my-pi/pi-ai/error";
 
 const model = { id: "claude-haiku-4-5", provider: "kiro-native", api: "kiro-codewhisperer-stream" };
 const context: OmpContext = { systemPrompt: "Be concise", messages: [{ role: "user", content: "Hello" }] };
@@ -133,6 +134,30 @@ test("enterprise credential uses its own profile and IDE wire without CLI contin
     const { message } = await collect(context, { apiKey: auth }, { ...model, id: "claude-opus-5" });
     expect(message.content).toEqual([{ type: "text", text: "Enterprise reply" }]);
   }
+});
+
+test("social desktop credential uses its machine identity and IDE wire without a profile", async () => {
+  fetchSpy = spyOn(globalThis, "fetch").mockImplementation(Object.assign(async (url: RequestInfo | URL, init?: RequestInit) => {
+    expect(url).toBe("https://runtime.us-east-1.kiro.dev/");
+    const headers = new Headers(init?.headers);
+    expect(headers.get("authorization")).toBe("Bearer social-access");
+    expect(headers.get("x-amzn-kiro-client-attribution")).toBe("kiro-ide");
+    expect(headers.get("user-agent")).toContain("KiroIDE-1.1.70-machine-1");
+    expect(headers.get("x-amz-user-agent")).toContain("KiroIDE-1.1.70-machine-1");
+    const request = JSON.parse(String(init?.body));
+    expect(request.conversationState.currentMessage.userInputMessage.origin).toBe("AI_EDITOR");
+    expect(request.conversationState.agentTaskType).toBeUndefined();
+    return framesToChunkedResponse([encodeEventFrame("assistantResponseEvent", { content: "Social reply" })]);
+  }, { preconnect: globalThis.fetch.preconnect }));
+
+  const auth = kiroOAuthProvider().getApiKey({
+    access: "social-access",
+    refresh: "social-refresh",
+    expires: 0,
+    kiro: { apiRegion: "us-east-1", authType: "kiro_desktop", machineId: "machine-1" },
+  });
+  const { message } = await collect(context, { apiKey: auth }, { ...model, id: "claude-opus-5" });
+  expect(message.content).toEqual([{ type: "text", text: "Social reply" }]);
 });
 
 test("streams aliased tool object and chunked input as native calls", async () => {
@@ -279,6 +304,132 @@ test("complete string input ends the tool call before later text; nested fake pa
   expect(message.content).toEqual([{ type: "toolCall", id: "toolu-1", name: "eval", arguments: { code: "ok" } }, { type: "text", text: "After tool" }]);
 });
 
+test("an incomplete tool at end of stream is dropped as length while completed calls survive", async () => {
+  fetchSpy = spyOn(globalThis, "fetch").mockImplementation(Object.assign(async () => framesToChunkedResponse([
+    encodeEventFrame("assistantResponseEvent", { content: "Writing." }),
+    encodeEventFrame("toolUseEvent", { toolUseId: "toolu-complete", name: "eval", input: '{"code":"ok"}', stop: true }),
+    encodeEventFrame("toolUseEvent", { toolUseId: "toolu-cut", name: "eval", input: '{"code":' }),
+  ]), { preconnect: globalThis.fetch.preconnect }));
+  const { events, message } = await collect();
+  expect(events.at(-1)?.type).toBe("done");
+  expect(message.stopReason).toBe("toolUse");
+  expect(message.content).toEqual([
+    { type: "text", text: "Writing." },
+    { type: "toolCall", id: "toolu-complete", name: "eval", arguments: { code: "ok" } },
+  ]);
+  expect(events.filter(event => event.type === "toolcall_end")).toHaveLength(1);
+});
+
+test("MODEL_TEMPORARILY_UNAVAILABLE before output errors but after output becomes length", async () => {
+  const load = () => framesToChunkedResponse([
+    encodeEventFrame("error", { reason: "MODEL_TEMPORARILY_UNAVAILABLE", message: "Encountered unexpectedly high load" }),
+  ]);
+  const afterOutput = () => framesToChunkedResponse([
+    encodeEventFrame("assistantResponseEvent", { content: "Partial answer" }),
+    encodeEventFrame("error", { reason: "MODEL_TEMPORARILY_UNAVAILABLE", message: "Encountered unexpectedly high load" }),
+  ]);
+  const responses = [load(), afterOutput()];
+  fetchSpy = spyOn(globalThis, "fetch").mockImplementation(Object.assign(async () => responses.shift()!, { preconnect: globalThis.fetch.preconnect }));
+  const before = await collect();
+  expect(before.events.at(-1)?.type).toBe("error");
+  expect(before.message.stopReason).toBe("error");
+  const after = await collect();
+  expect(after.events.at(-1)?.type).toBe("done");
+  expect(after.message.stopReason).toBe("length");
+  expect(after.message.content).toEqual([{ type: "text", text: "Partial answer" }]);
+});
+
+test("MODEL_TEMPORARILY_UNAVAILABLE inside an open tool drops only that call", async () => {
+  fetchSpy = spyOn(globalThis, "fetch").mockImplementation(Object.assign(async () => framesToChunkedResponse([
+    encodeEventFrame("toolUseEvent", { toolUseId: "toolu-cut", name: "eval", input: '{"code":' }),
+    encodeEventFrame("error", { reason: "MODEL_TEMPORARILY_UNAVAILABLE", message: "Encountered unexpectedly high load" }),
+  ]), { preconnect: globalThis.fetch.preconnect }));
+  const { events, message } = await collect();
+  expect(events.at(-1)?.type).toBe("done");
+  expect(message.stopReason).toBe("length");
+  expect(message.content).toEqual([]);
+  expect(events.filter(event => event.type === "toolcall_end")).toHaveLength(0);
+});
+
+test("a cut after a completed tool keeps the tool turn", async () => {
+  fetchSpy = spyOn(globalThis, "fetch").mockImplementation(Object.assign(async () => framesToChunkedResponse([
+    encodeEventFrame("toolUseEvent", { toolUseId: "toolu-complete", name: "eval", input: '{"code":"ok"}', stop: true }),
+    encodeEventFrame("toolUseEvent", { toolUseId: "toolu-cut", name: "eval", input: '{"code":' }),
+    encodeEventFrame("error", { reason: "MODEL_TEMPORARILY_UNAVAILABLE", message: "Encountered unexpectedly high load" }),
+  ]), { preconnect: globalThis.fetch.preconnect }));
+  const { message } = await collect();
+  expect(message.stopReason).toBe("toolUse");
+  expect(message.content).toEqual([
+    { type: "toolCall", id: "toolu-complete", name: "eval", arguments: { code: "ok" } },
+  ]);
+});
+
+test("a malformed complete tool argument remains an error", async () => {
+  fetchSpy = spyOn(globalThis, "fetch").mockImplementation(Object.assign(async () => framesToChunkedResponse([
+    encodeEventFrame("toolUseEvent", { toolUseId: "toolu-bad", name: "eval", input: '{"code":tru}', stop: true }),
+  ]), { preconnect: globalThis.fetch.preconnect }));
+  const { events, message } = await collect();
+  expect(events.at(-1)?.type).toBe("error");
+  expect(message.stopReason).toBe("error");
+  expect(message.errorMessage).toMatch(/Unexpected|Expected/);
+});
+
+test("HTTP context overflow preserves reason and size diagnostics", async () => {
+  fetchSpy = spyOn(globalThis, "fetch").mockImplementation(Object.assign(async () => new Response(JSON.stringify({
+    reason: "CONTENT_LENGTH_EXCEEDS_THRESHOLD",
+    message: "Payload is too large",
+    contentLength: 1234,
+    threshold: 1000,
+  }), { status: 400, headers: { "content-type": "application/json" } }), { preconnect: globalThis.fetch.preconnect }));
+  const { message } = await collect();
+  expect(message.stopReason).toBe("error");
+  expect(message.errorStatus).toBe(400);
+  expect(message.errorMessage).toContain("CONTENT_LENGTH_EXCEEDS_THRESHOLD");
+  expect(message.errorMessage).toContain("1234");
+  expect(message.errorMessage).toContain("1000");
+  const diagnostics = message as typeof message & { errorId?: number; errorClassificationMessage?: string };
+  expect(diagnostics.errorClassificationMessage).toBe("context limit reached");
+  expect(diagnostics.errorId).toBe(Flag.ContextOverflow);
+});
+
+test("metadata stop reasons normalize case and whitespace", async () => {
+  const cases: Array<[string, "stop" | "length" | "toolUse"]> = [
+    [" end_turn ", "stop"],
+    ["STOP_SEQUENCE", "stop"],
+    ["complete", "stop"],
+    ["MAX_TOKEN", "length"],
+    ["length", "length"],
+    ["MODEL_CONTEXT_WINDOW_EXCEEDED", "length"],
+    ["tool_use", "toolUse"],
+    ["content-filtered", "stop"],
+  ];
+  const responses = cases.map(([stopReason]) => framesToChunkedResponse([
+    encodeEventFrame("metadataEvent", { stopReason }),
+    encodeEventFrame("assistantResponseEvent", { content: "Answer" }),
+  ]));
+  fetchSpy = spyOn(globalThis, "fetch").mockImplementation(Object.assign(async () => responses.shift()!, { preconnect: globalThis.fetch.preconnect }));
+  for (const [, expected] of cases) {
+    const { message } = await collect();
+    expect(message.stopReason).toBe(expected);
+  }
+});
+
+test("repeated valid credit readings add without mapping to tokens or cost", async () => {
+  fetchSpy = spyOn(globalThis, "fetch").mockImplementation(Object.assign(async () => framesToChunkedResponse([
+    encodeEventFrame("meteringEvent", { unit: "credit", usage: 1.25 }),
+    encodeEventFrame("meteringEvent", { unit: "credits", amount: 0 }),
+    encodeEventFrame("meteringEvent", { credits: 2 }),
+    encodeEventFrame("meteringEvent", { credit: -1 }),
+    encodeEventFrame("meteringEvent", { credits: "invalid" }),
+    encodeEventFrame("assistantResponseEvent", { content: "Answer" }),
+  ]), { preconnect: globalThis.fetch.preconnect }));
+  const { message } = await collect();
+  expect(message.usage.credits?.cost).toBe(3.25);
+  expect(message.usage.input).toBe(0);
+  expect(message.usage.output).toBe(0);
+  expect(message.usage.cost.total).toBe(0);
+});
+
 test("HTTP, Smithy exception, stream error and broken CRC fail as error events", async () => {
   const responses = [
     new Response("unauthorized", { status: 401 }),
@@ -327,6 +478,7 @@ interface CapturedOutboundPayload {
   };
   additionalModelRequestFields?: {
     reasoning?: { effort: string };
+    thinking?: { type: string; display: string };
     output_config?: { effort: string };
   };
 }
@@ -369,12 +521,14 @@ test("outbound JSON carries native output_config.effort for Opus 5 and 5.5 at tr
 
   expect(captured).toHaveLength(2);
   expect(captured[0].additionalModelRequestFields).toEqual({
+    thinking: { type: "adaptive", display: "summarized" },
     output_config: { effort: "medium" },
   });
   expect(captured[0].conversationState.currentMessage.userInputMessage.content).toBe("Be concise\n\nHello");
   expect(captured[0].conversationState.currentMessage.userInputMessage.modelId).toBe("claude-opus-5");
 
   expect(captured[1].additionalModelRequestFields).toEqual({
+    thinking: { type: "adaptive", display: "summarized" },
     output_config: { effort: "low" },
   });
   expect(captured[1].conversationState.currentMessage.userInputMessage.content).toBe("Be concise\n\nHello");
@@ -455,10 +609,10 @@ test("outbound JSON leaves fields and content unmodified when reasoning is disab
   );
 
   expect(captured).toHaveLength(2);
-  for (const payload of captured) {
-    expect(payload.additionalModelRequestFields).toBeUndefined();
-    expect(payload.conversationState.currentMessage.userInputMessage.content).toBe("Be concise\n\nHello");
-  }
+  expect(captured[0].additionalModelRequestFields).toEqual({ reasoning: { effort: "none" } });
+  expect(captured[0].conversationState.currentMessage.userInputMessage.content).toBe("Be concise\n\nHello");
+  expect(captured[1].additionalModelRequestFields).toBeUndefined();
+  expect(captured[1].conversationState.currentMessage.userInputMessage.content).toBe("Be concise\n\nHello");
 });
 
 test("outbound JSON leaves tool-result turn content unmodified even with effort active", async () => {

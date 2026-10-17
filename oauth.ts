@@ -1,3 +1,4 @@
+import { loginWithSocialProvider } from "./social-login";
 const BUILDER_ID_START_URL = "https://view.awsapps.com/start";
 const DEFAULT_REGION = "us-east-1";
 const CLIENT_NAME = "omp-kiro-native";
@@ -16,6 +17,7 @@ export interface KiroMetadata {
   apiRegion?: string;
   clientId?: string;
   clientSecret?: string;
+  machineId?: string;
   authType?: "kiro_desktop" | "aws_sso_oidc";
 }
 
@@ -55,7 +57,9 @@ interface LoginCallbacks {
   fetch?: FetchLike;
   signal?: AbortSignal;
   onProgress?: (message: string) => void;
-  onAuth?: (details: { url: string; instructions: string }) => void;
+  onAuth?: (details: { url: string; launchUrl?: string; instructions?: string }) => void;
+  onPrompt?: (prompt: { message: string; placeholder?: string; allowEmpty?: boolean; secret?: boolean }) => Promise<string>;
+  onManualCodeInput?: (signal?: AbortSignal) => Promise<string>;
 }
 
 function oidcUrl(region: string, path: string): string {
@@ -63,10 +67,25 @@ function oidcUrl(region: string, path: string): string {
   return "https://oidc." + region + ".amazonaws.com" + path;
 }
 
+function desktopRefreshUrl(region: string): string {
+  if (!/^[a-z]{2}(?:-gov)?-[a-z]+-\d$/.test(region)) throw new Error("Invalid AWS region " + region);
+  return `https://prod.${region}.auth.desktop.kiro.dev/refreshToken`;
+}
+
 async function jsonRequest(fetchImpl: FetchLike, url: string, body: unknown, signal?: AbortSignal): Promise<{ response: Response; data: Record<string, unknown> }> {
+  return jsonRequestWithHeaders(fetchImpl, url, body, signal);
+}
+
+async function jsonRequestWithHeaders(
+  fetchImpl: FetchLike,
+  url: string,
+  body: unknown,
+  signal?: AbortSignal,
+  headers?: Record<string, string>,
+): Promise<{ response: Response; data: Record<string, unknown> }> {
   const response = await fetchImpl(url, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...headers },
     body: JSON.stringify(body),
     redirect: "error",
     signal,
@@ -79,16 +98,59 @@ async function jsonRequest(fetchImpl: FetchLike, url: string, body: unknown, sig
       if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error("invalid response");
       data = parsed as Record<string, unknown>;
     }
-    catch { throw new Error("Kiro SSO OIDC returned non-JSON HTTP " + response.status); }
+    catch {
+      const error = new Error("Kiro SSO OIDC returned non-JSON HTTP " + response.status);
+      Object.assign(error, { status: response.status });
+      throw error;
+    }
   }
   return { response, data };
 }
 
 function oidcError(stage: string, response: Response, data: Record<string, unknown>): Error {
-  const code = typeof data?.error === "string" ? data.error : undefined;
-  const description = typeof data?.error_description === "string" ? data.error_description : undefined;
-  const suffix = [code, description].filter(Boolean).join(": ");
-  return new Error("Kiro " + stage + " failed: HTTP " + response.status + (suffix ? " (" + suffix + ")" : ""));
+  const code = typeof data?.error === "string" && [
+    "access_denied",
+    "authorization_pending",
+    "authorization_pending_exception",
+    "invalid_client",
+    "invalid_grant",
+    "invalid_request",
+    "slow_down",
+    "slow_down_exception",
+    "server_error",
+    "temporarily_unavailable",
+  ].includes(data.error) ? data.error : undefined;
+  const suffix = code ? " (" + code + ")" : "";
+  return new Error("Kiro " + stage + " failed: HTTP " + response.status + suffix);
+}
+
+function refreshedExpiry(expiresIn: number): number {
+  const now = Date.now();
+  return Math.max(now + 1_000, now + Math.max(1, expiresIn * 1_000 - 60_000));
+}
+
+function canReuseCredential(credentials: KiroCredential): boolean {
+  return credentials.expires > Date.now();
+}
+
+const transientRefreshBackoff = new WeakMap<object, number>();
+
+function reuseAfterTransient(credentials: KiroCredential): boolean {
+  if (!canReuseCredential(credentials)) return false;
+  const now = Date.now();
+  if ((transientRefreshBackoff.get(credentials) ?? 0) > now) return true;
+  transientRefreshBackoff.set(credentials, now + 30_000);
+  return true;
+}
+
+function isTransientRefreshError(error: unknown): boolean {
+  if (!error || typeof error !== "object" || !("status" in error)) return true;
+  const status = (error as { status?: unknown }).status;
+  return typeof status !== "number" || transientStatus(status);
+}
+
+function transientStatus(status: number): boolean {
+  return status === 408 || status === 429 || status >= 500;
 }
 
 async function registerClient(fetchImpl: FetchLike, region: string, signal?: AbortSignal): Promise<RegisterClientResponse> {
@@ -191,23 +253,64 @@ export async function refreshKiroCredential(
 ): Promise<KiroCredential> {
   const metadata = credentials.kiro;
   const region = metadata?.ssoRegion ?? DEFAULT_REGION;
-  if (!credentials.refresh || !metadata?.clientId || !metadata?.clientSecret) {
+  if (!credentials.refresh) {
     throw new Error("Kiro refresh metadata is missing; sign in to Kiro again");
   }
-  const { response, data } = await jsonRequest(fetchImpl, oidcUrl(region, "/token"), {
-    clientId: metadata.clientId,
-    clientSecret: metadata.clientSecret,
-    grantType: "refresh_token",
-    refreshToken: credentials.refresh,
-  }, signal);
-  if (!response.ok || typeof data?.accessToken !== "string" || Number(data?.expiresIn) <= 0) {
+  if (metadata?.authType === "kiro_desktop") {
+    let response: { response: Response; data: Record<string, unknown> };
+    try {
+      response = await jsonRequestWithHeaders(
+        fetchImpl,
+        desktopRefreshUrl(region),
+        { refreshToken: credentials.refresh },
+        signal,
+        { accept: "application/json", "user-agent": `KiroIDE-1.1.70-${metadata.machineId ?? "unknown"}` },
+      );
+    } catch (error) {
+      if (!signal?.aborted && isTransientRefreshError(error) && reuseAfterTransient(credentials)) return credentials;
+      throw error;
+    }
+    if (!response.response.ok && transientStatus(response.response.status) && reuseAfterTransient(credentials)) return credentials;
+    if (!response.response.ok || typeof response.data?.accessToken !== "string" || !Number.isFinite(Number(response.data?.expiresIn ?? 3600)) || Number(response.data?.expiresIn ?? 3600) <= 0) {
+      throw oidcError("token refresh", response.response, response.data);
+    }
+    transientRefreshBackoff.delete(credentials);
+    return {
+      ...credentials,
+      access: response.data.accessToken,
+      refresh: typeof response.data.refreshToken === "string" && response.data.refreshToken ? response.data.refreshToken : credentials.refresh,
+      expires: refreshedExpiry(Number(response.data.expiresIn ?? 3600)),
+      kiro: { ...metadata },
+    };
+  }
+  if (!metadata?.clientId || !metadata?.clientSecret) {
+    throw new Error("Kiro refresh metadata is missing; sign in to Kiro again");
+  }
+  let response: Response;
+  let data: Record<string, unknown>;
+  try {
+    const result = await jsonRequest(fetchImpl, oidcUrl(region, "/token"), {
+      clientId: metadata.clientId,
+      clientSecret: metadata.clientSecret,
+      grantType: "refresh_token",
+      refreshToken: credentials.refresh,
+    }, signal);
+    response = result.response;
+    data = result.data;
+  } catch (error) {
+    if (!signal?.aborted && isTransientRefreshError(error) && reuseAfterTransient(credentials)) return credentials;
+    throw error;
+  }
+  if (!response.ok && transientStatus(response.status) && reuseAfterTransient(credentials)) return credentials;
+  if (!response.ok || typeof data?.accessToken !== "string" || !Number.isFinite(Number(data?.expiresIn)) || Number(data?.expiresIn) <= 0) {
     throw oidcError("token refresh", response, data);
   }
+  transientRefreshBackoff.delete(credentials);
   return {
     ...credentials,
     access: data.accessToken,
     refresh: typeof data.refreshToken === "string" && data.refreshToken ? data.refreshToken : credentials.refresh,
-    expires: Date.now() + Number(data.expiresIn) * 1000,
+    expires: refreshedExpiry(Number(data.expiresIn)),
     kiro: { ...metadata },
   };
 }
@@ -218,6 +321,20 @@ export function kiroOAuthProvider() {
     async login(callbacks: LoginCallbacks): Promise<KiroCredential> {
       const fetchImpl = callbacks?.fetch ?? globalThis.fetch;
       const signal = callbacks?.signal;
+      let selection = "";
+      if (callbacks?.onPrompt) {
+        selection = String(await callbacks.onPrompt({
+          message: "Choose Kiro sign-in method: Builder ID, Google, or GitHub",
+          placeholder: "Builder ID",
+          allowEmpty: true,
+        }) ?? "").trim().toLowerCase();
+      }
+      if (selection === "google" || selection === "github") {
+        return loginWithSocialProvider(selection, callbacks);
+      }
+      if (selection && selection !== "builder" && selection !== "builder id" && selection !== "aws" && selection !== "aws builder id") {
+        throw new Error("Unknown Kiro sign-in method; choose Builder ID, Google, or GitHub");
+      }
       const region = DEFAULT_REGION;
       callbacks?.onProgress?.("Registering Kiro device login...");
       const registration = await registerClient(fetchImpl, region, signal);
@@ -251,6 +368,7 @@ export function kiroOAuthProvider() {
         token: credentials.access,
         apiRegion: credentials.kiro?.apiRegion,
         profileArn: credentials.kiro?.profileArn,
+        machineId: credentials.kiro?.machineId,
         authType: credentials.kiro?.authType,
       });
     },

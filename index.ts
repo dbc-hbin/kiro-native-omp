@@ -32,7 +32,7 @@ export default function kiroNativeExtension(pi: ExtensionApi): void {
         mode: "effort",
         efforts: KIRO_EFFORTS,
       },
-      input: ["text"],
+      input: ["text", "image"],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow,
       maxTokens: 32_000,

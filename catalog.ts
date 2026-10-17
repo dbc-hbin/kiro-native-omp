@@ -44,34 +44,79 @@ export interface KiroModelDefinition {
     mode: "effort";
     efforts: typeof KIRO_EFFORTS;
   };
-  input: Array<"text">;
+  input: Array<"text" | "image">;
   cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
   contextWindow: number;
   maxTokens: number;
 }
 
-/** OMP supplies the bare access token here, not the OAuth getApiKey envelope. */
-export async function fetchKiroModels(apiKey: string | undefined): Promise<readonly KiroModelDefinition[]> {
-  const token = apiKey?.trim();
-  if (!token || token.startsWith("ksk_") || token.startsWith("{")) {
+function discoveryCredentials(apiKey: string | undefined): {
+  token: string;
+  region: string;
+  profileArn?: string;
+  machineId?: string;
+} {
+  const value = apiKey?.trim();
+  if (!value || value.startsWith("ksk_")) {
     throw new Error("Kiro model discovery requires an AWS Builder ID OAuth token");
   }
+  if (!value.startsWith("{")) {
+    return { token: value, region: "us-east-1", profileArn: BUILDER_ID_SERVICE_PROFILE_ARN };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    throw new Error("Invalid Kiro OAuth credential envelope");
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Invalid Kiro OAuth credential envelope");
+  }
+  const data = parsed as Record<string, unknown>;
+  if (data.version !== 1 || typeof data.token !== "string" || !data.token.trim() || data.token.trim().startsWith("ksk_")) {
+    throw new Error("Invalid Kiro OAuth credential envelope");
+  }
+  const region = data.apiRegion ?? "us-east-1";
+  if (typeof region !== "string" || !/^[a-z]{2}(?:-gov)?-[a-z]+-\d$/.test(region)) {
+    throw new Error("Invalid Kiro AWS region");
+  }
+  const profileArn = typeof data.profileArn === "string" && data.profileArn ? data.profileArn : undefined;
+  return {
+    token: data.token,
+    region,
+    ...(profileArn ? { profileArn } : {}),
+    ...(typeof data.machineId === "string" && data.machineId ? { machineId: data.machineId } : {}),
+  };
+}
 
-  const url = new URL("https://management.us-east-1.kiro.dev/");
+export async function fetchKiroModels(apiKey: string | undefined): Promise<readonly KiroModelDefinition[]> {
+  const credentials = discoveryCredentials(apiKey);
+
+  const url = new URL(`https://management.${credentials.region}.kiro.dev/`);
   url.searchParams.set("origin", "AI_EDITOR");
-  url.searchParams.set("profileArn", BUILDER_ID_SERVICE_PROFILE_ARN);
+  if (credentials.profileArn) url.searchParams.set("profileArn", credentials.profileArn);
+  const ideBuild = credentials.machineId
+    ? `KiroIDE-1.1.70-${credentials.machineId}-KAS/0.66.7`
+    : undefined;
   const response = await fetch(url, {
     method: "POST",
     redirect: "error",
     signal: AbortSignal.timeout(10_000),
     headers: {
-      authorization: `Bearer ${token}`,
+      authorization: `Bearer ${credentials.token}`,
       "content-type": "application/x-amz-json-1.0",
       accept: "application/json",
       "x-amz-target": TARGET,
       "x-amzn-codewhisperer-optout": "true",
+      ...(ideBuild ? {
+        "user-agent": `aws-sdk-js/1.0.0 ua/2.1 os/win32#10.0.26200 lang/js md/nodejs#24.18.0 api/kirocontrolplanebearer#1.0.0 m/N,E ${ideBuild}`,
+        "x-amz-user-agent": `aws-sdk-js/1.0.0 ${ideBuild}`,
+      } : {}),
     },
-    body: JSON.stringify({ origin: "AI_EDITOR", profileArn: BUILDER_ID_SERVICE_PROFILE_ARN }),
+    body: JSON.stringify({
+      origin: "AI_EDITOR",
+      ...(credentials.profileArn ? { profileArn: credentials.profileArn } : {}),
+    }),
   });
   if (!response.ok) throw new Error(`Kiro model discovery failed (HTTP ${response.status})`);
 
@@ -92,6 +137,8 @@ export async function fetchKiroModels(apiKey: string | undefined): Promise<reado
     const limits = "tokenLimits" in row ? row.tokenLimits : undefined;
     const inputLimit = limits !== null && typeof limits === "object" && "maxInputTokens" in limits
       ? limits.maxInputTokens : undefined;
+    const outputLimit = limits !== null && typeof limits === "object" && "maxOutputTokens" in limits
+      ? limits.maxOutputTokens : undefined;
     const known = knownModels.get(id);
     const contextWindow = typeof inputLimit === "number" && Number.isSafeInteger(inputLimit) && inputLimit > 0
       ? inputLimit : known?.contextWindow ?? 32_000;
@@ -104,10 +151,12 @@ export async function fetchKiroModels(apiKey: string | undefined): Promise<reado
         mode: "effort",
         efforts: KIRO_EFFORTS,
       },
-      input: ["text"],
+      input: ["text", "image"],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow,
-      maxTokens: Math.min(contextWindow, 32_000),
+      maxTokens: typeof outputLimit === "number" && Number.isSafeInteger(outputLimit) && outputLimit > 0
+        ? Math.min(contextWindow, outputLimit)
+        : Math.min(contextWindow, 32_000),
     });
   }
   if (models.length === 0) throw new Error("Kiro model discovery returned no usable models");

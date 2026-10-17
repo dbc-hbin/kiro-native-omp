@@ -74,6 +74,49 @@ describe("Kiro account model catalog discovery", () => {
     });
   });
 
+  test("uses social credential metadata for management discovery and output limits", async () => {
+    let capturedUrl = "";
+    let capturedHeaders: Headers | undefined;
+    let capturedBody = "";
+    fetchSpy = spyOn(globalThis, "fetch").mockImplementation(
+      Object.assign(
+        async (input: RequestInfo | URL, init?: RequestInit) => {
+          capturedUrl = input.toString();
+          capturedHeaders = new Headers(init?.headers);
+          capturedBody = String(init?.body);
+          return new Response(JSON.stringify({
+            models: [{
+              modelId: "social-model",
+              tokenLimits: { maxInputTokens: 128_000, maxOutputTokens: 4_096 },
+            }],
+          }), { status: 200, headers: { "content-type": "application/json" } });
+        },
+        { preconnect: globalThis.fetch.preconnect },
+      ),
+    );
+
+    const models = await fetchKiroModels(JSON.stringify({
+      version: 1,
+      token: "social-access",
+      apiRegion: "eu-west-1",
+      profileArn: "arn:aws:codewhisperer:eu-west-1:123456789012:profile/SOCIAL",
+      authType: "kiro_desktop",
+      machineId: "machine-1",
+    }));
+
+    const url = new URL(capturedUrl);
+    expect(url.origin).toBe("https://management.eu-west-1.kiro.dev");
+    expect(url.searchParams.get("profileArn")).toBe("arn:aws:codewhisperer:eu-west-1:123456789012:profile/SOCIAL");
+    expect(capturedHeaders?.get("authorization")).toBe("Bearer social-access");
+    expect(capturedHeaders?.get("user-agent")).toContain("machine-1");
+    expect(JSON.parse(capturedBody)).toEqual({
+      origin: "AI_EDITOR",
+      profileArn: "arn:aws:codewhisperer:eu-west-1:123456789012:profile/SOCIAL",
+    });
+    expect(models[0].input).toEqual(["text", "image"]);
+    expect(models[0].maxTokens).toBe(4_096);
+  });
+
   test("filters duplicate and malformed model rows", async () => {
     fetchSpy = spyOn(globalThis, "fetch").mockImplementation(
       Object.assign(

@@ -4,6 +4,7 @@ import { buildKiroToolCatalog, createToolNameRegistry } from "./schema";
 import type {
   BuiltKiroRequest,
   KiroHistoryEntry,
+  KiroImage,
   KiroReasoningContent,
   KiroToolResult,
   KiroToolUse,
@@ -20,6 +21,7 @@ const EMPTY_RESULT = "The tool completed without textual output.";
 // Same placeholders OMP's transformMessages synthesizes for built-in providers.
 const MISSING_RESULT = "No result provided";
 const ABORTED_RESULT = "aborted";
+const MAX_IMAGE_BYTES = 3.75 * 1024 * 1024;
 
 /**
  * Kiro has no tool_choice field. Like OMP's transports without native forcing,
@@ -38,14 +40,21 @@ function offeredTools(tools: readonly OmpTool[], toolChoice: StreamOptionsLike["
 
 const VALID_EFFORTS = new Set<string>(KIRO_EFFORTS);
 
-const NATIVE_EFFORT_FIELDS: Record<string, "reasoning" | "output_config"> = {
+const NATIVE_EFFORT_FIELDS: Record<string, "reasoning" | "thinking_output_config"> = {
   "gpt-5.6-sol": "reasoning",
   "gpt-5.6-terra": "reasoning",
   "gpt-5.6-luna": "reasoning",
   "gpt-6-sol": "reasoning",
   "gpt-6-luna": "reasoning",
-  "claude-opus-5": "output_config",
-  "claude-opus-5.5": "output_config",
+  "claude-opus-4.6": "thinking_output_config",
+  "claude-opus-4.7": "thinking_output_config",
+  "claude-opus-4.8": "thinking_output_config",
+  "claude-opus-5": "thinking_output_config",
+  "claude-opus-5.5": "thinking_output_config",
+  "claude-sonnet-4.6": "thinking_output_config",
+  "claude-sonnet-5": "thinking_output_config",
+  "claude-sonnet-5.5": "thinking_output_config",
+  "kimi-k3": "thinking_output_config",
 };
 
 const EFFORT_RATIOS: Record<KiroEffort, number> = {
@@ -63,7 +72,7 @@ const THINKING_INSTRUCTION = [
 ].join("\n");
 
 type Turn =
-  | { kind: "user"; content: string; toolResults: KiroToolResult[] }
+  | { kind: "user"; content: string; toolResults: KiroToolResult[]; images: KiroImage[] }
   | { kind: "assistant"; content: string; toolUses: KiroToolUse[]; reasoningContent?: KiroReasoningContent };
 
 function append(target: string, next: string): string {
@@ -74,6 +83,48 @@ function append(target: string, next: string): string {
 function contentText(content: string | OmpContent[] | Array<{ type: string; text?: string }>): string {
   if (typeof content === "string") return content;
   return content.filter((part): part is { type: "text"; text: string } => part.type === "text" && "text" in part && typeof part.text === "string").map(part => part.text).join("");
+}
+
+function imageFormat(mimeType: string): KiroImage["format"] {
+  switch (mimeType.toLowerCase()) {
+    case "image/png": return "png";
+    case "image/jpeg": return "jpeg";
+    case "image/gif": return "gif";
+    case "image/webp": return "webp";
+    default: throw new Error(`Unsupported Kiro image MIME type ${JSON.stringify(mimeType)}`);
+  }
+}
+
+function toKiroImage(image: { data: string; mimeType: string }): KiroImage {
+  if (typeof image.data !== "string" || typeof image.mimeType !== "string") {
+    throw new Error("Kiro image MIME type and data must be strings");
+  }
+  const format = imageFormat(image.mimeType);
+  let bytes = image.data;
+  if (bytes.startsWith("data:")) {
+    const comma = bytes.indexOf(",");
+    const header = comma >= 0 ? bytes.slice(5, comma) : "";
+    const [embeddedMime, encoding] = header.split(";");
+    if (encoding !== "base64" || embeddedMime.toLowerCase() !== `image/${format}`) {
+      throw new Error("Kiro image data URL must contain matching base64 MIME metadata");
+    }
+    bytes = comma >= 0 ? bytes.slice(comma + 1) : "";
+  }
+  if (!bytes || bytes.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(bytes)) {
+    throw new Error("Kiro image data must be nonempty canonical base64");
+  }
+  const padding = bytes.endsWith("==") ? 2 : bytes.endsWith("=") ? 1 : 0;
+  if (Math.floor(bytes.length * 3 / 4) - padding > MAX_IMAGE_BYTES) {
+    throw new Error(`Kiro image exceeds the ${MAX_IMAGE_BYTES} byte limit`);
+  }
+  const decoded = Buffer.from(bytes, "base64");
+  if (decoded.length === 0 || decoded.toString("base64") !== bytes) {
+    throw new Error("Kiro image data must be nonempty canonical base64");
+  }
+  if (decoded.length > MAX_IMAGE_BYTES) {
+    throw new Error(`Kiro image exceeds the ${MAX_IMAGE_BYTES} byte limit`);
+  }
+  return { format, source: { bytes } };
 }
 
 function normalizedToolId(id: string): string {
@@ -105,13 +156,14 @@ function conversationId(context: OmpContext): string {
   return randomUUID();
 }
 
-function pushUser(turns: Turn[], content: string, toolResults: KiroToolResult[] = []): void {
+function pushUser(turns: Turn[], content: string, toolResults: KiroToolResult[] = [], images: KiroImage[] = []): void {
   const last = turns.at(-1);
   if (last?.kind === "user") {
     last.content = append(last.content, content);
     last.toolResults.push(...toolResults);
+    last.images.push(...images);
   } else {
-    turns.push({ kind: "user", content, toolResults: [...toolResults] });
+    turns.push({ kind: "user", content, toolResults: [...toolResults], images: [...images] });
   }
 }
 
@@ -157,11 +209,11 @@ export function buildKiroRequest(
 
   for (const msg of context.messages) {
     if (msg.role === "user" || msg.role === "developer") {
-      if (Array.isArray(msg.content) && msg.content.some(part => part.type === "image")) {
-        throw new Error("Kiro bearer does not translate user image content");
-      }
       flushPending();
-      pushUser(turns, contentText(msg.content));
+      const images = Array.isArray(msg.content)
+        ? msg.content.filter((part): part is Extract<OmpContent, { type: "image" }> => part.type === "image").map(toKiroImage)
+        : [];
+      pushUser(turns, contentText(msg.content), [], images);
       continue;
     }
     if (msg.role === "assistant") {
@@ -193,31 +245,38 @@ export function buildKiroRequest(
       continue;
     }
     if (msg.role !== "toolResult") throw new Error("Unsupported Kiro message role");
-    if (msg.content.some(part => part.type === "image")) {
-      throw new Error("Kiro bearer does not translate tool-result image content");
-    }
     const toolUseId = normalizedToolId(msg.toolCallId);
     const text = contentText(msg.content);
+    const images = msg.content
+      .filter((part): part is Extract<typeof part, { type: "image" }> => part.type === "image")
+      .map(toKiroImage);
     if (pending.get(toolUseId) === msg.toolCallId) {
       pending.delete(toolUseId);
+      const lastTurn = turns.at(-1);
+      const toolResultHasPeers = pending.size > 0 || (lastTurn?.kind === "user" && lastTurn.toolResults.length > 0);
+      const imageLabel = images.length ? `[image:${images.map(image => image.format).join(",")}]` : "";
+      const resultText = text.trim()
+        ? text
+        : imageLabel || EMPTY_RESULT;
       pushUser(turns, "", [{
         toolUseId,
         status: msg.isError ? "error" : "success",
-        content: [{ text: text.trim() ? text : EMPTY_RESULT }],
-      }]);
+        content: [{ text: toolResultHasPeers && imageLabel ? `${resultText}\n${imageLabel}` : resultText }],
+      }], images);
       continue;
     }
     // A late or duplicate result for an already-answered call would break
     // adjacency; drop it. An orphan (its call folded away by compaction) keeps
     // its text as plain user content once no result window is open.
-    if (priorCalls.has(toolUseId) || pending.size > 0 || !text.trim()) continue;
+    if (priorCalls.has(toolUseId) || pending.size > 0 || (!text.trim() && !images.length)) continue;
     const errorAttr = msg.isError ? ' is-error="true"' : "";
-    pushUser(turns, `<stale-tool-result tool="${msg.toolName}" id="${msg.toolCallId}"${errorAttr}>\n${text}\n</stale-tool-result>`);
+    const orphanText = text.trim() || `[image:${images.map(image => image.format).join(",")}]`;
+    pushUser(turns, `<stale-tool-result tool="${msg.toolName}" id="${msg.toolCallId}"${errorAttr}>\n${orphanText}${images.length && text.trim() ? `\n[image:${images.map(image => image.format).join(",")}]` : ""}\n</stale-tool-result>`, [], images);
   }
   flushPending();
 
-  if (turns.length === 0 || turns[0].kind === "assistant") turns.unshift({ kind: "user", content: CONTINUATION, toolResults: [] });
-  if (turns.at(-1)?.kind === "assistant") turns.push({ kind: "user", content: CONTINUATION, toolResults: [] });
+  if (turns.length === 0 || turns[0].kind === "assistant") turns.unshift({ kind: "user", content: CONTINUATION, toolResults: [], images: [] });
+  if (turns.at(-1)?.kind === "assistant") turns.push({ kind: "user", content: CONTINUATION, toolResults: [], images: [] });
 
   const current = turns.pop();
   if (!current || current.kind !== "user") throw new Error("Kiro request must end with a user turn");
@@ -237,6 +296,7 @@ export function buildKiroRequest(
         userInputMessage: {
           content: turn.content,
           origin: wireClient === "cli" ? "KIRO_CLI" : "AI_EDITOR",
+          ...(turn.images.length ? { images: turn.images } : {}),
           ...(turn.toolResults.length ? { userInputMessageContext: { toolResults: turn.toolResults } } : {}),
         },
       };
@@ -245,6 +305,7 @@ export function buildKiroRequest(
     content: current.content,
     modelId: wireModelId,
     origin: wireClient === "cli" ? "KIRO_CLI" : "AI_EDITOR",
+    ...(current.images.length ? { images: current.images } : {}),
     userInputMessageContext: {
       envState: {
         operatingSystem: process.platform === "darwin" ? "macos" : process.platform === "win32" ? "windows" : process.platform,
@@ -260,27 +321,35 @@ export function buildKiroRequest(
     else currentMessage.content = systemPrefix + currentMessage.content;
   }
 
-  const reasoning = options?.reasoning;
-  const isReasoningOff =
+  const reasoning = options?.reasoning as KiroEffort | "none" | undefined;
+  const explicitReasoningOff =
     options?.disableReasoning === true ||
     options?.forceReasoningOff === true ||
-    !reasoning;
+    reasoning === "none";
+  const isReasoningOff = explicitReasoningOff || !reasoning;
   let additionalModelRequestFields: KiroRequestPayload["additionalModelRequestFields"];
 
-  if (!isReasoningOff) {
-    if (!VALID_EFFORTS.has(reasoning)) {
+  if (explicitReasoningOff && NATIVE_EFFORT_FIELDS[wireModelId] === "reasoning") {
+    additionalModelRequestFields = { reasoning: { effort: "none" } };
+  } else if (!isReasoningOff) {
+    if (typeof reasoning !== "string" || !VALID_EFFORTS.has(reasoning)) {
       throw new Error(`Kiro ${wireModelId} does not support reasoning effort ${JSON.stringify(reasoning)}`);
     }
     const effort = reasoning as KiroEffort;
-    let nativeField: "reasoning" | "output_config" | undefined;
+    let nativeField: "reasoning" | "thinking_output_config" | undefined;
     if ((wireModelId === "gpt-5.6-terra" || wireModelId === "gpt-5.6-luna") && effort === "xhigh") {
       nativeField = undefined;
     } else {
       nativeField = NATIVE_EFFORT_FIELDS[wireModelId];
     }
 
-    if (nativeField) {
-      additionalModelRequestFields = { [nativeField]: { effort } };
+    if (nativeField === "reasoning") {
+      additionalModelRequestFields = { reasoning: { effort } };
+    } else if (nativeField === "thinking_output_config") {
+      additionalModelRequestFields = {
+        thinking: { type: "adaptive", display: "summarized" },
+        output_config: { effort },
+      };
     } else if (!isContinuation && !hasToolResults) {
       const maxTokens = options?.maxTokens || 4096;
       const ratio = EFFORT_RATIOS[effort];
@@ -325,7 +394,7 @@ export function validateKiroConversation(payload: KiroRequestPayload): void {
     if (role === previous) throw new Error(`Kiro roles must alternate; repeated ${role}`);
     previous = role;
     if (user) {
-      if (!user.content.trim() && !user.userInputMessageContext?.toolResults?.length) throw new Error("Kiro user message is empty");
+      if (!user.content.trim() && !user.userInputMessageContext?.toolResults?.length && !user.images?.length) throw new Error("Kiro user message is empty");
       for (const { toolUseId, content } of user.userInputMessageContext?.toolResults ?? []) {
         if (!toolUseId) throw new Error("Kiro tool result is missing its id");
         if (!content.length || content.some(block => !block.text.trim())) throw new Error(`Kiro tool result is empty ${toolUseId}`);
