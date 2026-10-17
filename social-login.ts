@@ -1,6 +1,7 @@
 import type { KiroCredential, KiroMetadata } from "./oauth";
 
 export type SocialLoginProvider = "google" | "github";
+type RequestedProvider = SocialLoginProvider | undefined;
 
 export interface SocialLoginCallbacks {
   fetch?: typeof globalThis.fetch;
@@ -39,7 +40,8 @@ function optionForProvider(provider: SocialLoginProvider): string {
   return provider;
 }
 
-function providerLabel(provider: SocialLoginProvider): string {
+function providerLabel(provider: RequestedProvider): string {
+  if (provider === undefined) return "Kiro";
   return provider === "google" ? "Google" : "GitHub";
 }
 
@@ -58,7 +60,11 @@ function callbackError(message: string): Error {
   return new Error(message);
 }
 
-function callbackParams(input: string, provider: SocialLoginProvider, state: string): URLSearchParams {
+function callbackParams(
+  input: string,
+  provider: RequestedProvider,
+  state: string,
+): { params: URLSearchParams; provider: SocialLoginProvider } {
   const value = input.trim();
   if (!value) throw callbackError("Kiro sign-in callback is empty");
 
@@ -73,7 +79,11 @@ function callbackParams(input: string, provider: SocialLoginProvider, state: str
     } else {
       const queryLike = value.startsWith("?") || /(?:^|&)(?:state|login_option|error)=/.test(value);
       if (!queryLike) {
-        params = new URLSearchParams({ state, login_option: optionForProvider(provider), code: value });
+        params = new URLSearchParams({
+          state,
+          ...(provider ? { login_option: optionForProvider(provider) } : {}),
+          code: value,
+        });
       } else {
         params = new URLSearchParams(value.startsWith("?") ? value.slice(1) : value);
       }
@@ -86,13 +96,17 @@ function callbackParams(input: string, provider: SocialLoginProvider, state: str
   if (params.getAll("state").length !== 1 || params.get("state") !== state) {
     throw callbackError("Kiro sign-in callback state is invalid");
   }
-  if (params.getAll("login_option").length !== 1 || params.get("login_option") !== optionForProvider(provider)) {
+  const callbackProvider = params.get("login_option");
+  if (params.getAll("login_option").length !== 1 || (callbackProvider !== "google" && callbackProvider !== "github")) {
+    throw callbackError("Kiro sign-in callback provider is invalid");
+  }
+  if (provider && callbackProvider !== optionForProvider(provider)) {
     throw callbackError("Kiro sign-in callback provider is invalid");
   }
   if (params.getAll("code").length > 1 || params.getAll("error").length > 1) {
     throw callbackError("Kiro sign-in callback is invalid");
   }
-  return params;
+  return { params, provider: callbackProvider };
 }
 
 async function parseJson(response: Response): Promise<Record<string, unknown>> {
@@ -170,7 +184,7 @@ function cancellationError(): Error {
   return new Error("Kiro sign-in cancelled");
 }
 
-export async function loginWithSocialProvider(provider: SocialLoginProvider, callbacks: SocialLoginCallbacks): Promise<KiroCredential> {
+async function loginWithBrowserProvider(provider: RequestedProvider, callbacks: SocialLoginCallbacks): Promise<KiroCredential> {
   const fetchImpl = callbacks.fetch ?? globalThis.fetch;
   const signal = callbacks.signal;
   if (signal?.aborted) throw cancellationError();
@@ -185,7 +199,7 @@ export async function loginWithSocialProvider(provider: SocialLoginProvider, cal
   authorizationUrl.searchParams.set("code_challenge_method", "S256");
   authorizationUrl.searchParams.set("state", state);
   authorizationUrl.searchParams.set("redirect_from", "KiroIDE");
-  authorizationUrl.searchParams.set("signin_methods", optionForProvider(provider));
+  if (provider) authorizationUrl.searchParams.set("signin_methods", optionForProvider(provider));
 
   callbacks.onProgress?.(`Preparing ${providerLabel(provider)} sign-in...`);
 
@@ -236,7 +250,8 @@ export async function loginWithSocialProvider(provider: SocialLoginProvider, cal
     rejectResult(error);
   };
   const complete = async (urlOrInput: string): Promise<"accepted" | "duplicate"> => {
-    const params = callbackParams(urlOrInput, provider, state);
+    const callback = callbackParams(urlOrInput, provider, state);
+    const { params, provider: selectedProvider } = callback;
     if (claimed) return "duplicate";
     claimed = true;
     const callbackErrorValue = params.get("error");
@@ -245,7 +260,7 @@ export async function loginWithSocialProvider(provider: SocialLoginProvider, cal
       return "accepted";
     }
     try {
-      const credentials = await exchangeCode(fetchImpl, provider, verifier, params.get("code") ?? "", machineId, flowSignal);
+      const credentials = await exchangeCode(fetchImpl, selectedProvider, verifier, params.get("code") ?? "", machineId, flowSignal);
       finished = true;
       cleanup();
       resolveResult(credentials);
@@ -285,7 +300,10 @@ export async function loginWithSocialProvider(provider: SocialLoginProvider, cal
         ? await callbacks.onManualCodeInput(flowSignal)
         : callbacks.onPrompt
           ? await Promise.race([
-            callbacks.onPrompt({ message: "Paste the Kiro callback URL (or code):", placeholder: "http://localhost:3128/oauth/callback..." }),
+            callbacks.onPrompt({
+              message: provider ? "Paste the Kiro callback URL (or code):" : "Paste the full Kiro callback URL:",
+              placeholder: "http://localhost:3128/oauth/callback...",
+            }),
             new Promise<string>((_, reject) => {
               flowSignal.addEventListener("abort", () => reject(cancellationError()), { once: true });
             }),
@@ -300,6 +318,14 @@ export async function loginWithSocialProvider(provider: SocialLoginProvider, cal
     callbacks.onProgress?.("Waiting for the Kiro browser callback...");
   }
   return result;
+}
+
+export async function loginWithKiroBrowser(callbacks: SocialLoginCallbacks): Promise<KiroCredential> {
+  return loginWithBrowserProvider(undefined, callbacks);
+}
+
+export async function loginWithSocialProvider(provider: SocialLoginProvider, callbacks: SocialLoginCallbacks): Promise<KiroCredential> {
+  return loginWithBrowserProvider(provider, callbacks);
 }
 
 export { CALLBACK_PATH, REDIRECT_URI, TOKEN_URL, exchangeRedirectUri };

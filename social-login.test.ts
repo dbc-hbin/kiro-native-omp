@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { exchangeRedirectUri, loginWithSocialProvider } from "./social-login";
+import { exchangeRedirectUri, loginWithKiroBrowser, loginWithSocialProvider } from "./social-login";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -60,6 +60,28 @@ describe("Kiro social browser login", () => {
       profileArn: "arn:aws:codewhisperer:us-east-1:123:profile/social",
       machineId: "machine-from-server",
     });
+  });
+
+  test("one Kiro browser login leaves provider choice to app.kiro.dev", async () => {
+    let authUrl = "";
+    const ready = deferred<void>();
+    const fetchImpl = Object.assign(async () => new Response(JSON.stringify({
+      accessToken: "access-value",
+      refreshToken: "refresh-value",
+      expiresIn: 3600,
+    }), { status: 200 }), { preconnect: globalThis.fetch.preconnect });
+    const login = loginWithKiroBrowser({
+      fetch: fetchImpl,
+      onAuth(info) {
+        authUrl = info.url;
+        ready.resolve();
+      },
+    });
+    await ready.promise;
+    const auth = new URL(authUrl);
+    expect(auth.searchParams.get("signin_methods")).toBeNull();
+    expect((await fetch(callbackUrl(authUrl, "google", "chosen-by-web"))).status).toBe(200);
+    expect((await login).access).toBe("access-value");
   });
 
   test("rejects wrong state and provider before accepting the callback", async () => {

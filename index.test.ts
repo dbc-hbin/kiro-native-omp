@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { KIRO_EFFORTS, type KiroEffort } from "./constants";
 import kiroNativeExtension from "./index";
 import { buildKiroRequest, validateKiroConversation } from "./messages";
-import { kiroOAuthProvider, refreshKiroCredential } from "./oauth";
+import { refreshKiroCredential } from "./oauth";
 import { buildKiroToolCatalog, createToolNameRegistry, ensureKiroRootObject, sanitizeKiroSchema } from "./schema";
 import type { OmpContext, StreamOptionsLike } from "./types";
 
@@ -303,38 +303,6 @@ describe("Kiro native OMP translation", () => {
     expect(() => buildKiroRequest(context("image/bmp", "AA=="), "gpt-5.6-sol")).toThrow(/MIME type/);
     expect(() => buildKiroRequest(context("image/png", "not-base64"), "gpt-5.6-sol")).toThrow(/canonical base64/);
     expect(() => buildKiroRequest(context("image/png", "AA"), "gpt-5.6-sol")).toThrow(/canonical base64/);
-  });
-
-  test("OAuth login surfaces the real AWS device authorization URL", async () => {
-    const responses = [
-      new Response(JSON.stringify({ clientId: "client", clientSecret: "secret", clientSecretExpiresAt: 4_000_000_000 }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      }),
-      new Response(JSON.stringify({
-        deviceCode: "device",
-        userCode: "ABCD-EFGH",
-        verificationUri: "https://device.sso.us-east-1.amazonaws.com/",
-        verificationUriComplete: "https://device.sso.us-east-1.amazonaws.com/?user_code=ABCD-EFGH",
-        interval: 0,
-        expiresIn: 60,
-      }), { status: 200, headers: { "content-type": "application/json" } }),
-      new Response(JSON.stringify({ accessToken: "access", refreshToken: "refresh", expiresIn: 3600 }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      }),
-    ];
-    const fetchImpl = Object.assign(async () => responses.shift()!, { preconnect: globalThis.fetch.preconnect });
-    let authUrl = "";
-    const credentials = await kiroOAuthProvider().login({
-      fetch: fetchImpl,
-      onAuth(info: { url: string }) { authUrl = info.url; },
-    });
-    expect(authUrl).toBe("https://device.sso.us-east-1.amazonaws.com/?user_code=ABCD-EFGH");
-    expect(authUrl).not.toContain("example.invalid");
-    expect(credentials.access).toBe("access");
-    expect(credentials.kiro?.clientId).toBe("client");
-    expect(credentials.kiro?.profileArn).toBeUndefined();
   });
 
   test("OAuth refresh preserves Kiro private metadata", async () => {

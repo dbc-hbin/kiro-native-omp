@@ -1,4 +1,4 @@
-import { loginWithSocialProvider } from "./social-login";
+import { loginWithKiroBrowser } from "./social-login";
 const BUILDER_ID_START_URL = "https://view.awsapps.com/start";
 const DEFAULT_REGION = "us-east-1";
 const CLIENT_NAME = "omp-kiro-native";
@@ -317,47 +317,9 @@ export async function refreshKiroCredential(
 
 export function kiroOAuthProvider() {
   return {
-    name: "Kiro (AWS Builder ID)",
+    name: "Kiro",
     async login(callbacks: LoginCallbacks): Promise<KiroCredential> {
-      const fetchImpl = callbacks?.fetch ?? globalThis.fetch;
-      const signal = callbacks?.signal;
-      let selection = "";
-      if (callbacks?.onPrompt) {
-        selection = String(await callbacks.onPrompt({
-          message: "Choose Kiro sign-in method: Builder ID, Google, or GitHub",
-          placeholder: "Builder ID",
-          allowEmpty: true,
-        }) ?? "").trim().toLowerCase();
-      }
-      if (selection === "google" || selection === "github") {
-        return loginWithSocialProvider(selection, callbacks);
-      }
-      if (selection && selection !== "builder" && selection !== "builder id" && selection !== "aws" && selection !== "aws builder id") {
-        throw new Error("Unknown Kiro sign-in method; choose Builder ID, Google, or GitHub");
-      }
-      const region = DEFAULT_REGION;
-      callbacks?.onProgress?.("Registering Kiro device login...");
-      const registration = await registerClient(fetchImpl, region, signal);
-      callbacks?.onProgress?.("Requesting Kiro authorization code...");
-      const device = await startDeviceAuthorization(fetchImpl, region, registration, signal);
-      callbacks?.onAuth?.({
-        url: device.verificationUriComplete ?? device.verificationUri,
-        instructions: "Enter code: " + device.userCode,
-      });
-      callbacks?.onProgress?.("Waiting for Kiro authorization...");
-      const token = await pollForToken(fetchImpl, region, registration, device, signal);
-      return {
-        access: token.accessToken,
-        refresh: token.refreshToken ?? "",
-        expires: Date.now() + Number(token.expiresIn) * 1000,
-        kiro: {
-          ssoRegion: region,
-          apiRegion: region,
-          clientId: registration.clientId,
-          clientSecret: registration.clientSecret,
-          authType: "aws_sso_oidc",
-        },
-      };
+      return loginWithKiroBrowser(callbacks);
     },
     async refreshToken(credentials: KiroCredential, signal?: AbortSignal): Promise<KiroCredential> {
       return refreshKiroCredential(credentials, globalThis.fetch, signal);
