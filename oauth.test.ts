@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { refreshKiroCredential } from "./oauth";
+import { kiroOAuthProvider, refreshKiroCredential } from "./oauth";
 
 test("social refresh uses Kiro Desktop refresh and preserves metadata", async () => {
   let requestUrl = "";
@@ -46,4 +46,47 @@ test("an unexpired credential survives a transient refresh failure", async () =>
   });
   await expect(refreshKiroCredential(original, fetchImpl)).resolves.toBe(original);
   await expect(refreshKiroCredential(original, fetchImpl)).resolves.toBe(original);
+});
+
+test("unified Builder ID callback completes the AWS OIDC device flow", async () => {
+  let authUrl = "";
+  const ready = Promise.withResolvers<void>();
+  const responses = [
+    new Response(JSON.stringify({ clientId: "client", clientSecret: "secret" }), { status: 200 }),
+    new Response(JSON.stringify({
+      deviceCode: "device",
+      userCode: "ABCD-EFGH",
+      verificationUri: "https://device.sso.us-east-1.amazonaws.com/",
+      verificationUriComplete: "https://device.sso.us-east-1.amazonaws.com/?user_code=ABCD-EFGH",
+      interval: 0,
+      expiresIn: 60,
+    }), { status: 200 }),
+    new Response(JSON.stringify({
+      accessToken: `header.${Buffer.from(JSON.stringify({ email: "builder@example.com" })).toString("base64url")}.signature`,
+      refreshToken: "builder-refresh",
+      expiresIn: 3600,
+    }), { status: 200 }),
+  ];
+  const fetchImpl = Object.assign(async () => responses.shift()!, { preconnect: globalThis.fetch.preconnect });
+  const login = kiroOAuthProvider().login({
+    fetch: fetchImpl,
+    onAuth(info) {
+      if (!authUrl) {
+        authUrl = info.url;
+        ready.resolve();
+      }
+    },
+  });
+  await ready.promise;
+  const auth = new URL(authUrl);
+  const callback = new URL("http://127.0.0.1:3128/signin/callback");
+  callback.searchParams.set("state", auth.searchParams.get("state")!);
+  callback.searchParams.set("login_option", "builderid");
+  callback.searchParams.set("issuer_url", "https://view.awsapps.com/start/");
+  callback.searchParams.set("idc_region", "us-east-1");
+  expect((await fetch(callback)).status).toBe(200);
+  const credentials = await login;
+  expect(credentials.access).toContain("header.");
+  expect(credentials.email).toBe("builder@example.com");
+  expect(credentials.kiro?.authType).toBe("aws_sso_oidc");
 });

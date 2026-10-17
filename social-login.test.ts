@@ -84,6 +84,36 @@ describe("Kiro social browser login", () => {
     expect((await login).access).toBe("access-value");
   });
 
+  test("Builder ID signin callback enters the device login handoff", async () => {
+    let authUrl = "";
+    const ready = deferred<void>();
+    const login = loginWithKiroBrowser({
+      onAuth(info) {
+        authUrl = info.url;
+        ready.resolve();
+      },
+      onBuilderId: async (details) => {
+        expect(details.startUrl).toBe("https://view.awsapps.com/start/");
+        expect(details.region).toBe("us-east-1");
+        return {
+          access: "builder-access",
+          refresh: "builder-refresh",
+          expires: Date.now() + 3_600_000,
+          kiro: { authType: "aws_sso_oidc", apiRegion: details.region },
+        };
+      },
+    });
+    await ready.promise;
+    const auth = new URL(authUrl);
+    const callback = new URL("http://127.0.0.1:3128/signin/callback");
+    callback.searchParams.set("state", auth.searchParams.get("state")!);
+    callback.searchParams.set("login_option", "builderid");
+    callback.searchParams.set("issuer_url", "https://view.awsapps.com/start/");
+    callback.searchParams.set("idc_region", "us-east-1");
+    expect((await fetch(callback)).status).toBe(200);
+    expect((await login).access).toBe("builder-access");
+  });
+
   test("rejects wrong state and provider before accepting the callback", async () => {
     let authUrl = "";
     const ready = deferred<void>();

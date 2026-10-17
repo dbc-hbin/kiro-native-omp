@@ -1,6 +1,7 @@
 import type { KiroCredential, KiroMetadata } from "./oauth";
 
 export type SocialLoginProvider = "google" | "github";
+type CallbackProvider = SocialLoginProvider | "builderid";
 type RequestedProvider = SocialLoginProvider | undefined;
 
 export interface SocialLoginCallbacks {
@@ -10,12 +11,17 @@ export interface SocialLoginCallbacks {
   onAuth?: (details: { url: string; launchUrl?: string; instructions?: string }) => void;
   onManualCodeInput?: (signal?: AbortSignal) => Promise<string>;
   onPrompt?: (prompt: { message: string; placeholder?: string; allowEmpty?: boolean; secret?: boolean }) => Promise<string>;
+  onBuilderId?: (
+    details: { startUrl: string; region: string },
+    signal?: AbortSignal,
+  ) => Promise<KiroCredential>;
 }
 
 const SIGNIN_URL = "https://app.kiro.dev/signin";
 const TOKEN_URL = "https://prod.us-east-1.auth.desktop.kiro.dev/oauth/token";
 const REDIRECT_URI = "http://localhost:3128";
 const CALLBACK_PATH = "/oauth/callback";
+const BUILDER_CALLBACK_PATH = "/signin/callback";
 const CALLBACK_PORT = "3128";
 const FLOW_TIMEOUT_MS = 10 * 60_000;
 const IDE_VERSION = "1.1.70";
@@ -49,6 +55,24 @@ function exchangeRedirectUri(provider: SocialLoginProvider): string {
   return `${REDIRECT_URI}${CALLBACK_PATH}?login_option=${optionForProvider(provider)}`;
 }
 
+function validBuilderStartUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:"
+      && !url.username
+      && !url.password
+      && !url.port
+      && (url.hostname === "view.awsapps.com" || url.hostname.endsWith(".awsapps.com"))
+      && /^\/start\/?$/.test(url.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function validRegion(value: string): boolean {
+  return /^[a-z]{2}(?:-gov)?-[a-z]+-\d$/.test(value);
+}
+
 function safeErrorCode(value: unknown): string | undefined {
   if (typeof value !== "string") return undefined;
   return ["access_denied", "invalid_client", "invalid_grant", "invalid_request", "server_error", "temporarily_unavailable"].includes(value)
@@ -64,7 +88,7 @@ function callbackParams(
   input: string,
   provider: RequestedProvider,
   state: string,
-): { params: URLSearchParams; provider: SocialLoginProvider } {
+): { params: URLSearchParams; provider: CallbackProvider } {
   const value = input.trim();
   if (!value) throw callbackError("Kiro sign-in callback is empty");
 
@@ -72,7 +96,7 @@ function callbackParams(
   try {
     if (value.startsWith("http://") || value.startsWith("https://")) {
       const url = new URL(value);
-      if (url.protocol !== "http:" || url.port !== CALLBACK_PORT || !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname) || url.pathname !== CALLBACK_PATH || url.hash || url.username || url.password) {
+      if (url.protocol !== "http:" || url.port !== CALLBACK_PORT || !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname) || ![CALLBACK_PATH, BUILDER_CALLBACK_PATH].includes(url.pathname) || url.hash || url.username || url.password) {
         throw callbackError("Kiro sign-in callback URL is invalid");
       }
       params = url.searchParams;
@@ -97,16 +121,26 @@ function callbackParams(
     throw callbackError("Kiro sign-in callback state is invalid");
   }
   const callbackProvider = params.get("login_option");
-  if (params.getAll("login_option").length !== 1 || (callbackProvider !== "google" && callbackProvider !== "github")) {
+  if (params.getAll("login_option").length !== 1 || (callbackProvider !== "google" && callbackProvider !== "github" && callbackProvider !== "builderid")) {
     throw callbackError("Kiro sign-in callback provider is invalid");
   }
   if (provider && callbackProvider !== optionForProvider(provider)) {
     throw callbackError("Kiro sign-in callback provider is invalid");
   }
+  if (callbackProvider === "builderid") {
+    const startUrl = params.get("issuer_url") ?? "";
+    const region = params.get("idc_region") ?? "";
+    if (params.getAll("issuer_url").length !== 1 || !validBuilderStartUrl(startUrl)) {
+      throw callbackError("Kiro Builder ID callback start URL is invalid");
+    }
+    if (params.getAll("idc_region").length !== 1 || !validRegion(region)) {
+      throw callbackError("Kiro Builder ID callback region is invalid");
+    }
+  }
   if (params.getAll("code").length > 1 || params.getAll("error").length > 1) {
     throw callbackError("Kiro sign-in callback is invalid");
   }
-  return { params, provider: callbackProvider };
+  return { params, provider: callbackProvider as CallbackProvider };
 }
 
 async function parseJson(response: Response): Promise<Record<string, unknown>> {
@@ -211,7 +245,7 @@ async function loginWithBrowserProvider(provider: RequestedProvider, callbacks: 
         port: 3128,
         fetch(request) {
           const url = new URL(request.url);
-          if (url.pathname !== CALLBACK_PATH) return callbackPage("Not found", 404);
+          if (![CALLBACK_PATH, BUILDER_CALLBACK_PATH].includes(url.pathname)) return callbackPage("Not found", 404);
           return consume(url.toString(), true);
         },
       }));
@@ -260,7 +294,13 @@ async function loginWithBrowserProvider(provider: RequestedProvider, callbacks: 
       return "accepted";
     }
     try {
-      const credentials = await exchangeCode(fetchImpl, selectedProvider, verifier, params.get("code") ?? "", machineId, flowSignal);
+      const credentials = selectedProvider === "builderid"
+        ? await callbacks.onBuilderId?.({
+          startUrl: params.get("issuer_url")!,
+          region: params.get("idc_region")!,
+        }, flowSignal)
+        : await exchangeCode(fetchImpl, selectedProvider, verifier, params.get("code") ?? "", machineId, flowSignal);
+      if (!credentials) throw new Error("Kiro Builder ID login is unavailable");
       finished = true;
       cleanup();
       resolveResult(credentials);

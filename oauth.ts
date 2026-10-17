@@ -60,6 +60,10 @@ interface LoginCallbacks {
   onAuth?: (details: { url: string; launchUrl?: string; instructions?: string }) => void;
   onPrompt?: (prompt: { message: string; placeholder?: string; allowEmpty?: boolean; secret?: boolean }) => Promise<string>;
   onManualCodeInput?: (signal?: AbortSignal) => Promise<string>;
+  onBuilderId?: (
+    details: { startUrl: string; region: string },
+    signal?: AbortSignal,
+  ) => Promise<KiroCredential>;
 }
 
 function oidcUrl(region: string, path: string): string {
@@ -70,6 +74,22 @@ function oidcUrl(region: string, path: string): string {
 function desktopRefreshUrl(region: string): string {
   if (!/^[a-z]{2}(?:-gov)?-[a-z]+-\d$/.test(region)) throw new Error("Invalid AWS region " + region);
   return `https://prod.${region}.auth.desktop.kiro.dev/refreshToken`;
+}
+
+function emailFromAccessToken(accessToken: string): string | undefined {
+  const payload = accessToken.split(".")[1];
+  if (!payload) return undefined;
+  try {
+    const claims: unknown = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
+    if (claims === null || typeof claims !== "object" || Array.isArray(claims)) return undefined;
+    for (const key of ["email", "preferred_username", "upn"]) {
+      const value = (claims as Record<string, unknown>)[key];
+      if (typeof value === "string" && /^[^\s@]+@[^\s@]+$/.test(value.trim())) return value.trim();
+    }
+  } catch {
+    // AWS may issue an opaque access token; email is optional in that case.
+  }
+  return undefined;
 }
 
 async function jsonRequest(fetchImpl: FetchLike, url: string, body: unknown, signal?: AbortSignal): Promise<{ response: Response; data: Record<string, unknown> }> {
@@ -153,14 +173,19 @@ function transientStatus(status: number): boolean {
   return status === 408 || status === 429 || status >= 500;
 }
 
-async function registerClient(fetchImpl: FetchLike, region: string, signal?: AbortSignal): Promise<RegisterClientResponse> {
+async function registerClient(
+  fetchImpl: FetchLike,
+  region: string,
+  signal?: AbortSignal,
+  issuerUrl = BUILDER_ID_START_URL,
+): Promise<RegisterClientResponse> {
   const { response, data } = await jsonRequest(fetchImpl, oidcUrl(region, "/client/register"), {
     clientName: CLIENT_NAME,
     clientType: "public",
     scopes: CODEWHISPERER_SCOPES,
     grantTypes: ["urn:ietf:params:oauth:grant-type:device_code", "refresh_token"],
     redirectUris: [],
-    issuerUrl: BUILDER_ID_START_URL,
+    issuerUrl,
   }, signal);
   if (!response.ok) throw oidcError("client registration", response, data);
   if (typeof data?.clientId !== "string" || typeof data?.clientSecret !== "string") {
@@ -173,12 +198,13 @@ async function startDeviceAuthorization(
   fetchImpl: FetchLike,
   region: string,
   registration: RegisterClientResponse,
+  startUrl: string,
   signal?: AbortSignal,
 ): Promise<DeviceAuthorizationResponse> {
   const { response, data } = await jsonRequest(fetchImpl, oidcUrl(region, "/device_authorization"), {
     clientId: registration.clientId,
     clientSecret: registration.clientSecret,
-    startUrl: BUILDER_ID_START_URL,
+    startUrl,
   }, signal);
   if (!response.ok) throw oidcError("device authorization", response, data);
   if (typeof data?.deviceCode !== "string" || typeof data?.userCode !== "string" || typeof data?.verificationUri !== "string") {
@@ -246,6 +272,39 @@ async function pollForToken(
   throw new Error("Kiro device authorization timed out");
 }
 
+async function loginWithBuilderId(
+  fetchImpl: FetchLike,
+  startUrl: string,
+  region: string,
+  signal: AbortSignal | undefined,
+  callbacks: LoginCallbacks,
+): Promise<KiroCredential> {
+  callbacks.onProgress?.("Registering Kiro Builder ID device login...");
+  const registration = await registerClient(fetchImpl, region, signal, startUrl);
+  callbacks.onProgress?.("Requesting Kiro Builder ID authorization code...");
+  const device = await startDeviceAuthorization(fetchImpl, region, registration, startUrl, signal);
+  callbacks.onAuth?.({
+    url: device.verificationUriComplete ?? device.verificationUri,
+    instructions: "Approve this Builder ID device login in your browser. Enter code: " + device.userCode,
+  });
+  callbacks.onProgress?.("Waiting for Kiro Builder ID authorization...");
+  const token = await pollForToken(fetchImpl, region, registration, device, signal);
+  const email = emailFromAccessToken(token.accessToken);
+  return {
+    access: token.accessToken,
+    refresh: token.refreshToken ?? "",
+    expires: Date.now() + Number(token.expiresIn) * 1000,
+    ...(email ? { email } : {}),
+    kiro: {
+      ssoRegion: region,
+      apiRegion: region,
+      clientId: registration.clientId,
+      clientSecret: registration.clientSecret,
+      authType: "aws_sso_oidc",
+    },
+  };
+}
+
 export async function refreshKiroCredential(
   credentials: KiroCredential,
   fetchImpl: FetchLike = globalThis.fetch,
@@ -275,11 +334,13 @@ export async function refreshKiroCredential(
       throw oidcError("token refresh", response.response, response.data);
     }
     transientRefreshBackoff.delete(credentials);
+    const email = credentials.email ?? emailFromAccessToken(response.data.accessToken);
     return {
       ...credentials,
       access: response.data.accessToken,
       refresh: typeof response.data.refreshToken === "string" && response.data.refreshToken ? response.data.refreshToken : credentials.refresh,
       expires: refreshedExpiry(Number(response.data.expiresIn ?? 3600)),
+      ...(email ? { email } : {}),
       kiro: { ...metadata },
     };
   }
@@ -306,11 +367,13 @@ export async function refreshKiroCredential(
     throw oidcError("token refresh", response, data);
   }
   transientRefreshBackoff.delete(credentials);
+  const email = credentials.email ?? emailFromAccessToken(data.accessToken);
   return {
     ...credentials,
     access: data.accessToken,
     refresh: typeof data.refreshToken === "string" && data.refreshToken ? data.refreshToken : credentials.refresh,
     expires: refreshedExpiry(Number(data.expiresIn)),
+    ...(email ? { email } : {}),
     kiro: { ...metadata },
   };
 }
@@ -319,7 +382,17 @@ export function kiroOAuthProvider() {
   return {
     name: "Kiro",
     async login(callbacks: LoginCallbacks): Promise<KiroCredential> {
-      return loginWithKiroBrowser(callbacks);
+      const fetchImpl = callbacks.fetch ?? globalThis.fetch;
+      return loginWithKiroBrowser({
+        ...callbacks,
+        onBuilderId: (details, signal) => loginWithBuilderId(
+          fetchImpl,
+          details.startUrl,
+          details.region,
+          signal,
+          callbacks,
+        ),
+      });
     },
     async refreshToken(credentials: KiroCredential, signal?: AbortSignal): Promise<KiroCredential> {
       return refreshKiroCredential(credentials, globalThis.fetch, signal);
