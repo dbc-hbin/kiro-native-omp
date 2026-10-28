@@ -529,10 +529,14 @@ export function streamKiro(model: ModelLike, context: OmpContext, options?: Stre
         else if (part.type === "toolCall") { hasToolCall = true; hasAnswer = true; }
         else if (part.type === "text" && part.text.trim()) hasAnswer = true;
       }
+      const terminalReason = reasonToken(stopReason);
+      if (!hasAnswer && ["CONTENT_FILTER", "CONTENT_FILTERED", "GUARDRAIL_INTERVENED"].includes(terminalReason ?? "")) {
+        (message as OmpErrorFields).errorId = Flag.ContentBlocked;
+        throw new Error(`Kiro stopped before an answer or tool call: ${terminalReason}`);
+      }
       if (hasThinking && !hasAnswer) {
         // The text alone is not recognized by OMP's retry classifier.
-        const blocked = ["CONTENT_FILTER", "CONTENT_FILTERED", "GUARDRAIL_INTERVENED"].includes(reasonToken(stopReason) ?? "");
-        (message as OmpErrorFields).errorId = blocked ? Flag.ContentBlocked : Flag.EmptyResponse;
+        (message as OmpErrorFields).errorId = Flag.EmptyResponse;
         throw new Error("Kiro completed without an answer or tool call");
       }
       message.responseId ??= built.payload.conversationState.conversationId;

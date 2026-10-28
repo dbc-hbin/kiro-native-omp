@@ -169,19 +169,28 @@ test("thinking-only Kiro completions reach OMP as retryable empty responses", as
   }
 });
 
-test("explicitly filtered thinking-only Kiro responses are not retried", async () => {
+test("explicitly filtered Kiro responses without an answer preserve the reason and are not retried", async () => {
   for (const stopReason of ["CONTENT_FILTER", " content-filtered ", "GUARDRAIL_INTERVENED"]) {
-    const endpoint = kiroEndpoint([[
-      encodeEventFrame("reasoningContentEvent", { text: "Still reasoning" }),
-      encodeEventFrame("metadataEvent", { stopReason }),
-    ]]);
-    const result = await streamSimple(model, { messages: [{ role: "user", content: "hi", timestamp: 1 }] }, {
-      apiKey: "access-token", fetch: endpoint.fetch,
-    }).result();
-    expect(result.stopReason).toBe("error");
-    const errorId = classifyMessage(result);
-    expect(is(errorId, Flag.ContentBlocked)).toBe(true);
-    expect(retriable(errorId)).toBe(false);
+    for (const precedingFrames of [
+      [],
+      [encodeEventFrame("reasoningContentEvent", { text: "Still reasoning" })],
+      [encodeEventFrame("assistantResponseEvent", { content: " " })],
+    ]) {
+      const endpoint = kiroEndpoint([[
+        ...precedingFrames,
+        encodeEventFrame("metadataEvent", { stopReason }),
+      ]]);
+      const result = await streamSimple(model, { messages: [{ role: "user", content: "hi", timestamp: 1 }] }, {
+        apiKey: "access-token", fetch: endpoint.fetch,
+      }).result();
+      expect(result.stopReason).toBe("error");
+      expect(result.errorMessage).toContain(stopReason.trim().toUpperCase().replaceAll("-", "_"));
+      const errorId = classifyMessage(result);
+      expect(is(errorId, Flag.ContentBlocked)).toBe(true);
+      expect(is(errorId, Flag.EmptyResponse)).toBe(false);
+      expect(retriable(errorId)).toBe(false);
+      expect(endpoint.bodies).toHaveLength(1);
+    }
   }
 });
 
