@@ -530,6 +530,9 @@ export function streamKiro(model: ModelLike, context: OmpContext, options?: Stre
         else if (part.type === "text" && part.text.trim()) hasAnswer = true;
       }
       if (hasThinking && !hasAnswer) {
+        // The text alone is not recognized by OMP's retry classifier.
+        const blocked = ["CONTENT_FILTER", "CONTENT_FILTERED", "GUARDRAIL_INTERVENED"].includes(reasonToken(stopReason) ?? "");
+        (message as OmpErrorFields).errorId = blocked ? Flag.ContentBlocked : Flag.EmptyResponse;
         throw new Error("Kiro completed without an answer or tool call");
       }
       message.responseId ??= built.payload.conversationState.conversationId;

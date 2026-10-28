@@ -17,6 +17,7 @@ import {
 import { encodeEventFrame, framesToChunkedResponse } from "./eventstream";
 import { streamKiro } from "./stream";
 import type { KiroRequestPayload, OmpContext, StreamOptionsLike } from "./types";
+import { classifyMessage, Flag, is, retriable } from "@oh-my-pi/pi-ai/error";
 
 const API = "kiro-codewhisperer-stream";
 // OMP accepts any async iterable with `result()` here (the extension ships no
@@ -148,6 +149,40 @@ test("Kiro rejecting the model surfaces as an OMP error result with the HTTP sta
   expect(result.stopReason).toBe("error");
   expect(result.errorStatus).toBe(400);
   expect(result.errorMessage).toContain("INVALID_MODEL_ID");
+});
+
+test("thinking-only Kiro completions reach OMP as retryable empty responses", async () => {
+  for (const reasoning of [{ signature: "opaque-proof" }, { text: "Still reasoning" }]) {
+    const endpoint = kiroEndpoint([[
+      encodeEventFrame("reasoningContentEvent", reasoning),
+      encodeEventFrame("metadataEvent", { stopReason: "END_TURN" }),
+    ]]);
+    const result = await streamSimple(model, { messages: [{ role: "user", content: "hi", timestamp: 1 }] }, {
+      apiKey: "access-token", fetch: endpoint.fetch,
+    }).result();
+    expect(result.stopReason).toBe("error");
+    expect(result.content.every(part => part.type === "thinking")).toBe(true);
+    const errorId = classifyMessage(result);
+    expect(is(errorId, Flag.EmptyResponse)).toBe(true);
+    expect(retriable(errorId)).toBe(true);
+    expect(endpoint.bodies).toHaveLength(1);
+  }
+});
+
+test("explicitly filtered thinking-only Kiro responses are not retried", async () => {
+  for (const stopReason of ["CONTENT_FILTER", " content-filtered ", "GUARDRAIL_INTERVENED"]) {
+    const endpoint = kiroEndpoint([[
+      encodeEventFrame("reasoningContentEvent", { text: "Still reasoning" }),
+      encodeEventFrame("metadataEvent", { stopReason }),
+    ]]);
+    const result = await streamSimple(model, { messages: [{ role: "user", content: "hi", timestamp: 1 }] }, {
+      apiKey: "access-token", fetch: endpoint.fetch,
+    }).result();
+    expect(result.stopReason).toBe("error");
+    const errorId = classifyMessage(result);
+    expect(is(errorId, Flag.ContentBlocked)).toBe(true);
+    expect(retriable(errorId)).toBe(false);
+  }
 });
 
 const throttled = (headers: Record<string, string> = {}, reason = "USER_REQUEST_RATE_EXCEEDED") => new Response(
