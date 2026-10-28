@@ -46,6 +46,8 @@ export interface ModelLike {
   id: string;
   provider: string;
   api: string;
+  /** OMP catalog tokenizer family, e.g. "claude-v5"; absent means o200k. */
+  tokenizer?: string;
 }
 
 export interface StreamOptionsLike {
@@ -187,6 +189,8 @@ export interface OmpAssistantMessage {
   errorClassificationMessage?: string;
   errorMessage?: string;
   timestamp: number;
+  /** Request duration in milliseconds; OMP derives tokens/s from it. */
+  duration?: number;
 }
 
 export type OmpAssistantEvent =

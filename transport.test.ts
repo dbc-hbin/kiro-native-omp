@@ -3,15 +3,16 @@ import { encodeEventFrame, framesToChunkedResponse } from "./eventstream";
 import { buildKiroRequest } from "./messages";
 import { kiroOAuthProvider } from "./oauth";
 import { streamKiro } from "./stream";
-import type { OmpAssistantEvent, OmpContext, StreamOptionsLike } from "./types";
+import type { ModelLike, OmpAssistantEvent, OmpContext, StreamOptionsLike } from "./types";
 import { Flag } from "@oh-my-pi/pi-ai/error";
+import { countTokens, Encoding } from "@oh-my-pi/pi-natives";
 
 const model = { id: "claude-haiku-4-5", provider: "kiro-native", api: "kiro-codewhisperer-stream" };
 const context: OmpContext = { systemPrompt: "Be concise", messages: [{ role: "user", content: "Hello" }] };
 let fetchSpy: { mockRestore(): void } | undefined;
 afterEach(() => { fetchSpy?.mockRestore(); fetchSpy = undefined; });
 
-async function collect(ctx: OmpContext = context, options: StreamOptionsLike = { apiKey: "plain-access" }, selectedModel = model) {
+async function collect(ctx: OmpContext = context, options: StreamOptionsLike = { apiKey: "plain-access" }, selectedModel: ModelLike = model) {
   const stream = streamKiro(selectedModel, ctx, options);
   const events: OmpAssistantEvent[] = [];
   for await (const event of stream) events.push(event);
@@ -426,8 +427,26 @@ test("repeated valid credit readings add without mapping to tokens or cost", asy
   const { message } = await collect();
   expect(message.usage.credits?.cost).toBe(3.25);
   expect(message.usage.input).toBe(0);
-  expect(message.usage.output).toBe(0);
+  expect(message.usage.output).toBe(countTokens(["Answer"]));
   expect(message.usage.cost.total).toBe(0);
+});
+
+test("output tokens are estimated with the model tokenizer only when Kiro reports none", async () => {
+  const text = "캐시 적중률과 tokens/s 근사치";
+  const responses = [
+    framesToChunkedResponse([encodeEventFrame("assistantResponseEvent", { content: text })]),
+    framesToChunkedResponse([
+      encodeEventFrame("assistantResponseEvent", { content: text }),
+      encodeEventFrame("metadataEvent", { tokenUsage: { uncachedInputTokens: 10, outputTokens: 3 } }),
+    ]),
+  ];
+  fetchSpy = spyOn(globalThis, "fetch").mockImplementation(Object.assign(async () => responses.shift()!, { preconnect: globalThis.fetch.preconnect }));
+  const estimated = await collect(context, { apiKey: "plain-access" }, { ...model, tokenizer: "claude-v5" });
+  expect(estimated.message.usage.output).toBe(countTokens([text], Encoding.ClaudeV5));
+  expect(estimated.message.usage.output).not.toBe(countTokens([text]));
+  expect(estimated.message.duration).toBeGreaterThanOrEqual(0);
+  const reported = await collect(context, { apiKey: "plain-access" }, { ...model, tokenizer: "claude-v5" });
+  expect(reported.message.usage.output).toBe(3);
 });
 
 test("HTTP, Smithy exception, stream error and broken CRC fail as error events", async () => {

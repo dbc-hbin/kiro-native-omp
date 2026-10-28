@@ -3,6 +3,7 @@ import { decodeEventStream } from "./eventstream";
 import { buildKiroRequest } from "./messages";
 import type { JsonRecord, ModelLike, OmpAssistantEvent, OmpAssistantMessage, OmpContext, OmpContent, OmpUsage, StreamOptionsLike } from "./types";
 import { Flag } from "@oh-my-pi/pi-ai/error";
+import { countTokens, Encoding } from "@oh-my-pi/pi-natives";
 
 const TARGET = "AmazonCodeWhispererStreamingService.GenerateAssistantResponse";
 // Match CLI 2.26.0 first-request headers without accumulating appVersion tags on retries.
@@ -237,6 +238,22 @@ function applyUsage(message: OmpAssistantMessage, event: JsonRecord): void {
   message.usage.totalTokens = Number(usage.totalTokens ?? input + read + write + output);
 }
 
+// Kiro reports credits but no token usage. Estimate output tokens locally with
+// the model's OMP tokenizer so OMP can derive tokens/s; input and cache stay 0.
+function estimateOutputTokens(message: OmpAssistantMessage, model: ModelLike): void {
+  if (message.usage.output > 0) return;
+  const parts = message.content.flatMap(part =>
+    part.type === "text" ? [part.text]
+    : part.type === "thinking" ? [part.thinking]
+    : part.type === "toolCall" ? [part.name, JSON.stringify(part.arguments)]
+    : []);
+  if (!parts.length) return;
+  const family = model.tokenizer?.replaceAll("-", "");
+  const encoding = Object.values(Encoding).find(value => value.toLowerCase() === family);
+  message.usage.output = countTokens(parts, encoding);
+  message.usage.totalTokens = message.usage.input + message.usage.output;
+}
+
 function applyCredits(message: OmpAssistantMessage, event: JsonRecord): void {
   const nested = [event, record(event.metering), record(event.usage), record(event.meteringEvent)].filter(
     (entry): entry is JsonRecord => entry !== undefined,
@@ -271,6 +288,7 @@ export function streamKiro(model: ModelLike, context: OmpContext, options?: Stre
     role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id,
     usage: emptyUsage(), stopReason: "stop", timestamp: Date.now(),
   };
+  const startedAt = performance.now();
 
   void (async () => {
     stream.push({ type: "start", partial: message });
@@ -517,10 +535,13 @@ export function streamKiro(model: ModelLike, context: OmpContext, options?: Stre
       message.responseId ??= built.payload.conversationState.conversationId;
       const reason: DoneReason = hasToolCall ? "toolUse" : truncated ? "length" : normalizeStopReason(stopReason) ?? "stop";
       message.stopReason = reason;
+      estimateOutputTokens(message, model);
+      message.duration = performance.now() - startedAt;
       stream.push({ type: "done", reason, message });
     } catch (error) {
       message.stopReason = options?.signal?.aborted ? "aborted" : "error";
       message.errorMessage = error instanceof Error ? error.message : String(error);
+      message.duration = performance.now() - startedAt;
       stream.push({ type: "error", reason: message.stopReason, error: message });
     }
   })();
