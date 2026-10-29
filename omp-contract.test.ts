@@ -169,7 +169,7 @@ test("thinking-only Kiro completions reach OMP as retryable empty responses", as
   }
 });
 
-test("explicitly filtered Kiro responses without an answer preserve the reason and are not retried", async () => {
+test("explicitly filtered Kiro responses without an answer preserve the reason and stay retryable", async () => {
   for (const stopReason of ["CONTENT_FILTER", " content-filtered ", "GUARDRAIL_INTERVENED"]) {
     for (const precedingFrames of [
       [],
@@ -186,9 +186,9 @@ test("explicitly filtered Kiro responses without an answer preserve the reason a
       expect(result.stopReason).toBe("error");
       expect(result.errorMessage).toContain(stopReason.trim().toUpperCase().replaceAll("-", "_"));
       const errorId = classifyMessage(result);
-      expect(is(errorId, Flag.ContentBlocked)).toBe(true);
-      expect(is(errorId, Flag.EmptyResponse)).toBe(false);
-      expect(retriable(errorId)).toBe(false);
+      expect(is(errorId, Flag.ContentBlocked)).toBe(false);
+      expect(is(errorId, Flag.EmptyResponse)).toBe(true);
+      expect(retriable(errorId)).toBe(true);
       expect(endpoint.bodies).toHaveLength(1);
     }
   }

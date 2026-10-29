@@ -25,7 +25,7 @@ Tokens live in OMP's OAuth store. An offline model roster ships in the provider;
 
 - Builder ID sends the CLI-shaped request; enterprise credentials with a profile ARN send the IDE-shaped request.
 - Kiro's 429 request-rate throttle is retried in-provider up to 3 sends; exhausted quota fails fast so OMP's own retry/fallback takes over.
-- Thinking-only completions are reported as retryable `EmptyResponse` errors so OMP's configured retry/fallback can recover instead of treating them as unclassified failures. When no answer or tool call is delivered, explicit content-filter or guardrail stops report the server's normalized stop reason and remain non-retryable, including responses with no thinking content. These server stops are distinct from recoverable empty completions; retry classification does not remove them.
+- Thinking-only completions are reported as retryable `EmptyResponse` errors so OMP's configured retry/fallback can recover instead of treating them as unclassified failures. Content-filter or guardrail stops that deliver no answer or tool call keep the server's normalized stop reason in the message but are also retryable `EmptyResponse` errors: Kiro trips them on benign turns, and resending the same context recovers.
 - Tool pairing matches OMP's built-in providers.
 - Kiro reports credits but no token usage, so output tokens are estimated locally with the model's OMP tokenizer to drive the tokens/s readout. Input and cache tokens stay 0, so OMP's cache-hit figure for Kiro is not meaningful.
 

@@ -531,7 +531,10 @@ export function streamKiro(model: ModelLike, context: OmpContext, options?: Stre
       }
       const terminalReason = reasonToken(stopReason);
       if (!hasAnswer && ["CONTENT_FILTER", "CONTENT_FILTERED", "GUARDRAIL_INTERVENED"].includes(terminalReason ?? "")) {
-        (message as OmpErrorFields).errorId = Flag.ContentBlocked;
+        // Kiro's filter stops benign turns nondeterministically; resending the same context recovers.
+        (message as OmpErrorFields).errorId = Flag.EmptyResponse;
+        // OMP's text classifier marks "content_filter" as non-retryable ContentBlocked.
+        (message as OmpErrorFields).errorClassificationMessage = "Kiro completed without an answer or tool call";
         throw new Error(`Kiro stopped before an answer or tool call: ${terminalReason}`);
       }
       if (hasThinking && !hasAnswer) {
