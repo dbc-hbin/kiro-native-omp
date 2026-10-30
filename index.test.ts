@@ -359,6 +359,7 @@ describe("Kiro native OMP translation", () => {
     let registered: ProviderRegistration | undefined;
     kiroNativeExtension({
       setLabel() {},
+      on() {},
       registerProvider(_id: string, config: unknown) {
         registered = config as ProviderRegistration;
       },

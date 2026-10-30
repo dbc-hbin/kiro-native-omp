@@ -4,6 +4,9 @@
 // Kiro HTTP endpoint is replaced, through the `fetch` option OMP forwards.
 import { expect, test } from "bun:test";
 import { tmpdir } from "node:os";
+import { Database } from "bun:sqlite";
+import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai/auth-storage";
+import { registerOAuthProvider } from "@oh-my-pi/pi-ai/oauth";
 import {
   type AssistantMessage,
   type AssistantMessageEventStream,
@@ -15,6 +18,8 @@ import {
   type Tool,
 } from "@oh-my-pi/pi-ai";
 import { encodeEventFrame, framesToChunkedResponse } from "./eventstream";
+import kiroNativeExtension from "./index";
+import type { kiroOAuthProvider } from "./oauth";
 import { streamKiro } from "./stream";
 import type { KiroRequestPayload, OmpContext, StreamOptionsLike } from "./types";
 import { classifyMessage, Flag, is, retriable } from "@oh-my-pi/pi-ai/error";
@@ -55,6 +60,139 @@ function kiroEndpoint(responses: Array<Uint8Array[]>) {
   }, { preconnect: globalThis.fetch.preconnect });
   return { bodies, fetch: fetchImpl };
 }
+
+async function accountFixture(ids: string[]) {
+  type Api = Parameters<typeof kiroNativeExtension>[0];
+  const handlers = new Map<Parameters<Api["on"]>[0], Parameters<Api["on"]>[1]>();
+  kiroNativeExtension({
+    setLabel() {},
+    logger: { debug() {} },
+    on(event, handler) { handlers.set(event, handler); },
+    registerProvider(id, config) {
+      const { oauth } = config as { oauth: ReturnType<typeof kiroOAuthProvider> };
+      registerOAuthProvider({
+        id, ...oauth,
+        async login() { throw new Error("Interactive login is not part of the routing fixture"); },
+      });
+    },
+  });
+  const store = new SqliteAuthCredentialStore(new Database(":memory:"));
+  for (const id of ids) {
+    await store.upsertAuthCredential(model.provider, {
+      type: "oauth", access: `token-${id}`, refresh: `refresh-${id}`,
+      expires: Date.now() + 3_600_000, accountId: id,
+    });
+  }
+  const auth = new AuthStorage(store);
+  await auth.credentials.reload();
+  const emit = (event: Parameters<Api["on"]>[0], session: string, storage = auth, selectedModel = model) =>
+    handlers.get(event)!({ type: event }, {
+      model: selectedModel,
+      modelRegistry: { authStorage: storage },
+      sessionManager: { getSessionId: () => session },
+    });
+  const token = async (session: string, storage = auth) =>
+    JSON.parse((await storage.keys.get(model.provider, session))!).token as string;
+  return { store, auth, emit, token };
+}
+
+test("new Kiro sessions rotate accounts while turns, switches and resumes retain their bearer", async () => {
+  const fixture = await accountFixture(["A", "B", "C"]);
+  try {
+    const observed: string[] = [];
+    for (const session of ["one", "two", "one", "three", "two", "four"]) {
+      await fixture.emit("session_start", session);
+      await fixture.emit("input", session);
+      const apiKey = await fixture.auth.keys.get(model.provider, session);
+      const fetchImpl = Object.assign(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        observed.push(new Headers(init?.headers).get("authorization")!);
+        return framesToChunkedResponse([encodeEventFrame("assistantResponseEvent", { content: "OK" })]);
+      }, { preconnect: globalThis.fetch.preconnect });
+      const result = await streamSimple(model, {
+        messages: [{ role: "user", content: "hi", timestamp: 1 }],
+      }, { apiKey, fetch: fetchImpl }).result();
+      expect(result.stopReason).toBe("stop");
+    }
+    expect(observed).toEqual(["Bearer token-A", "Bearer token-B", "Bearer token-A",
+      "Bearer token-C", "Bearer token-B", "Bearer token-A"]);
+
+    const resumed = new AuthStorage(fixture.store);
+    await resumed.credentials.reload();
+    await fixture.emit("session_switch", "two", resumed);
+    expect(await fixture.token("two", resumed)).toBe("token-B");
+    const accountC = resumed.oauth.accounts(model.provider).find(account => account.accountId === "C")!;
+    resumed.sessions.pin(model.provider, "manual", accountC.credentialId);
+    await fixture.emit("session_start", "manual", resumed);
+    expect(await fixture.token("manual", resumed)).toBe("token-C");
+    resumed.sessions.inherit("two", "branch");
+    await fixture.emit("session_branch", "branch", resumed);
+    expect(await fixture.token("branch", resumed)).toBe("token-B");
+  } finally {
+    fixture.store.close();
+  }
+});
+
+test("overlapping lifecycle events allocate a session only once", async () => {
+  const fixture = await accountFixture(["A", "B", "C"]);
+  try {
+    await Promise.all([
+      fixture.emit("session_start", "one"),
+      fixture.emit("input", "one"),
+      fixture.emit("session_start", "two"),
+    ]);
+    expect(await fixture.token("one")).toBe("token-A");
+    expect(await fixture.token("two")).toBe("token-B");
+    await fixture.emit("session_branch", "three");
+    expect(await fixture.token("three")).toBe("token-C");
+  } finally {
+    fixture.store.close();
+  }
+});
+
+test("model cycling authenticates the preassigned account before changing the selected provider", async () => {
+  const fixture = await accountFixture(["A", "B", "C"]);
+  try {
+    const selectedModel = { ...model, provider: "other" };
+    const observed: string[] = [];
+    for (const session of ["one", "two", "three", "four"]) {
+      await fixture.emit("session_start", session, fixture.auth, selectedModel);
+      // OMP cycle_model resolves the candidate key before updating ctx.model.
+      observed.push(await fixture.token(session));
+      await fixture.emit("input", session);
+      expect(await fixture.token(session)).toBe(observed.at(-1)!);
+    }
+    expect(observed).toEqual(["token-A", "token-B", "token-C", "token-A"]);
+  } finally {
+    fixture.store.close();
+  }
+});
+
+test("late login and model switching bind on input without consuming accounts for other providers", async () => {
+  const fixture = await accountFixture([]);
+  try {
+    await fixture.emit("session_start", "late");
+    await fixture.auth.credentials.upsert(model.provider, {
+      type: "oauth", access: "token-A", refresh: "refresh-A",
+      expires: Date.now() + 3_600_000, accountId: "A",
+    });
+    await fixture.auth.credentials.upsert(model.provider, {
+      type: "oauth", access: "token-B", refresh: "refresh-B",
+      expires: Date.now() + 3_600_000, accountId: "B",
+    });
+    await fixture.emit("input", "other", fixture.auth, { ...model, provider: "other" });
+    await fixture.emit("input", "late");
+    expect(await fixture.token("late")).toBe("token-A");
+    await fixture.emit("input", "other");
+    expect(await fixture.token("other")).toBe("token-B");
+
+    fixture.auth.keys.setRuntime(model.provider, "explicit-key");
+    await fixture.emit("input", "override");
+    expect(await fixture.auth.keys.get(model.provider, "override")).toBe("explicit-key");
+    expect(fixture.auth.oauth.accounts(model.provider, "override").some(account => account.active)).toBe(false);
+  } finally {
+    fixture.store.close();
+  }
+});
 
 test("an OMP tool turn round-trips through streamSimple with the calls OMP executes", async () => {
   const endpoint = kiroEndpoint([
@@ -266,5 +404,94 @@ test("an exhausted monthly quota and a wait beyond OMP's cap are not retried", a
     expect(result.errorStatus).toBe(429);
     expect(waited).toBe(false);
     expect(endpoint.attempts).toHaveLength(1);
+  }
+});
+
+test("monthly quota exhaustion rotates the bearer and retains the replacement account", async () => {
+  for (const exhausted of [
+    () => throttled({}, "MONTHLY_REQUEST_COUNT"),
+    () => framesToChunkedResponse([encodeEventFrame("throttlingException", {
+      reason: "MONTHLY_REQUEST_COUNT", message: "Too many requests, please wait before trying again.",
+    }, "exception")]),
+  ]) {
+    const fixture = await accountFixture(["A", "B"]);
+    try {
+      await fixture.emit("session_start", "quota");
+      const sent: string[] = [];
+      const bodies: unknown[] = [];
+      const fetchImpl = Object.assign(async (_url: RequestInfo | URL, init?: RequestInit) => {
+        const bearer = new Headers(init?.headers).get("authorization")!;
+        sent.push(bearer);
+        bodies.push(JSON.parse(String(init?.body)));
+        return bearer === "Bearer token-A" ? exhausted()
+          : framesToChunkedResponse([encodeEventFrame("assistantResponseEvent", { content: "OK" })]);
+      }, { preconnect: globalThis.fetch.preconnect });
+      const context: Context = { messages: [{ role: "user", content: "hi", timestamp: 1 }] };
+      const options = {
+        apiKey: fixture.auth.keys.resolver(model.provider, { sessionId: "quota", modelId: model.id }),
+        fetch: fetchImpl,
+        providerRetryWait: async () => { throw new Error("Monthly quota must rotate without throttle waits"); },
+      };
+      const result = await streamSimple(model, context, options).result();
+      expect(result.stopReason).toBe("stop");
+      expect(result.content).toEqual([{ type: "text", text: "OK" }]);
+      expect(sent).toEqual(["Bearer token-A", "Bearer token-B"]);
+      const first = bodies[0] as KiroRequestPayload;
+      const second = bodies[1] as KiroRequestPayload;
+      expect(second.conversationState.currentMessage).toEqual(first.conversationState.currentMessage);
+      expect(await fixture.token("quota")).toBe("token-B");
+      await fixture.emit("input", "quota");
+      expect((await streamSimple(model, context, options).result()).stopReason).toBe("stop");
+      expect(sent).toEqual(["Bearer token-A", "Bearer token-B", "Bearer token-B"]);
+      expect(fixture.auth.oauth.accounts(model.provider).map(account => account.accountId)).toEqual(["A", "B"]);
+    } finally {
+      fixture.store.close();
+    }
+  }
+});
+
+test("exhausting every OAuth account stops after trying each without disabling credentials", async () => {
+  const fixture = await accountFixture(["A", "B"]);
+  try {
+    await fixture.emit("session_start", "all-spent");
+    const sent: string[] = [];
+    const fetchImpl = Object.assign(async (_url: RequestInfo | URL, init?: RequestInit) => {
+      sent.push(new Headers(init?.headers).get("authorization")!);
+      return throttled({}, "MONTHLY_REQUEST_COUNT");
+    }, { preconnect: globalThis.fetch.preconnect });
+    const result = await streamSimple(model, { messages: [{ role: "user", content: "hi", timestamp: 1 }] }, {
+      apiKey: fixture.auth.keys.resolver(model.provider, { sessionId: "all-spent", modelId: model.id }),
+      fetch: fetchImpl,
+      providerRetryWait: async () => { throw new Error("Monthly quota must not wait"); },
+    }).result();
+    expect(result.stopReason).toBe("error");
+    expect(is(classifyMessage(result), Flag.UsageLimit)).toBe(true);
+    expect(result.errorMessage).toContain("MONTHLY_REQUEST_COUNT");
+    expect(sent).toEqual(["Bearer token-A", "Bearer token-B"]);
+    expect(fixture.auth.oauth.accounts(model.provider).map(account => account.accountId)).toEqual(["A", "B"]);
+  } finally {
+    fixture.store.close();
+  }
+});
+
+test("transient request throttling does not rotate to another OAuth account", async () => {
+  const fixture = await accountFixture(["A", "B"]);
+  try {
+    await fixture.emit("session_start", "throttle");
+    const sent: string[] = [];
+    const fetchImpl = Object.assign(async (_url: RequestInfo | URL, init?: RequestInit) => {
+      sent.push(new Headers(init?.headers).get("authorization")!);
+      return throttled();
+    }, { preconnect: globalThis.fetch.preconnect });
+    const result = await streamSimple(model, { messages: [{ role: "user", content: "hi", timestamp: 1 }] }, {
+      apiKey: fixture.auth.keys.resolver(model.provider, { sessionId: "throttle", modelId: model.id }),
+      fetch: fetchImpl, providerRetryWait: async () => {},
+    }).result();
+    expect(result.stopReason).toBe("error");
+    expect(is(classifyMessage(result), Flag.UsageLimit)).toBe(false);
+    expect(sent).toEqual(["Bearer token-A", "Bearer token-A", "Bearer token-A"]);
+    expect(await fixture.token("throttle")).toBe("token-A");
+  } finally {
+    fixture.store.close();
   }
 });

@@ -138,6 +138,14 @@ function formatErrorBody(raw: string): { reason?: string; message: string; sizeT
 }
 
 function setErrorDiagnostics(message: OmpAssistantMessage, reason: string | undefined): void {
+  if (reasonToken(reason) === "MONTHLY_REQUEST_COUNT") {
+    // Kiro pairs this account quota code with transient "Too many requests"
+    // wording. Preserve the server error, but route through OMP's quota lane.
+    const diagnostic = message as OmpErrorFields;
+    diagnostic.errorClassificationMessage = "Kiro monthly quota exhausted";
+    diagnostic.errorId = Flag.UsageLimit;
+    return;
+  }
   if (reasonToken(reason) !== "CONTENT_LENGTH_EXCEEDS_THRESHOLD") return;
   const diagnostic = message as OmpErrorFields;
   diagnostic.errorClassificationMessage = "context limit reached";
@@ -421,6 +429,7 @@ export function streamKiro(model: ModelLike, context: OmpContext, options?: Stre
             break;
           }
           setErrorDiagnostics(message, reason);
+          setErrorDiagnostics(message, parsed.reason);
           const detail = frame.headers[":error-message"] ?? parsed.message ?? "Unknown error";
           throw new Error(`${name}: ${reason && !detail.includes(reason) ? `${reason}: ` : ""}${detail}`);
         }
